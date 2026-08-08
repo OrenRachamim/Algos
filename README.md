@@ -18,15 +18,27 @@ pip install -r requirements.txt
 ## שימוש
 
 ```bash
+# רשימת S&P 500 (נשמרת ל-sp500.txt)
+python micro_pullback.py universe
+
 # סריקת דפוסים היסטוריים + סטאפים פעילים
 python micro_pullback.py scan --tickers PAYX,MSFT,NVDA,AAPL --period 2y
 
-# אימון מודל החיזוי (מומלץ סל רחב והיסטוריה ארוכה)
-python micro_pullback.py train --tickers PAYX,MSFT,NVDA,AAPL,GOOG,AMZN,META,TSLA,JPM,V --period 5y
+# backtest מלא ב-R עם עלויות (תוחלת, profit factor, drawdown, פירוט שנתי)
+python micro_pullback.py backtest --tickers-file sp500.txt --period 10y
 
-# הסתברות לעלייה עבור pullback פעיל עכשיו
-python micro_pullback.py predict --tickers PAYX --period 2y
+# הערכת walk-forward: האם המודל מוסיף ערך מחוץ למדגם?
+python micro_pullback.py evaluate --tickers-file sp500.txt --period 10y --dataset trades.json
+
+# אימון המודל הסופי (רגרסור R + סף EV, נשמרים יחד)
+python micro_pullback.py train --dataset trades.json
+
+# סטאפים פעילים עכשיו עם R חזוי והכרעת TAKE/skip
+python micro_pullback.py predict --tickers-file sp500.txt --period 2y
 ```
+
+הורדות נשמרות ב-cache דיסק (`cache/`, ניתן לשינוי עם `--cache-dir`) —
+הרצה חוזרת לא מורידה שוב.
 
 עבודה בלי אינטרנט — קבצי CSV בפורמט `Date,Open,High,Low,Close,Volume`:
 
@@ -66,14 +78,36 @@ python micro_pullback.py scan --tickers PAYX --config my_config.json
 פרמטרים שאיתם המודל אומן — כדי שהזיהוי והחיזוי יהיו עקביים. אפשר לעקוף גם
 שם עם דגלים מפורשים (תודפס אזהרה).
 
-## המודל
+## המודל (meta-labeling)
 
-GradientBoosting על פיצ'רים של כל אירוע: עומק הריטרייס, אורך ה־pullback,
-יחס המחזורים, נפח יחסי של האימפולס (rvol), שיפוע הנפח בתוך הנסיגה
-(שלילי = המוכרים מתייבשים), RSI, מרחק מ־EMA10/20, שיפוע המגמה, ATR יחסי ועוד.
-תווית הצלחה: המחיר עולה ‎+1.5 ATR מעל שיא ה־pullback לפני שהוא יורד
-‎-1.0 ATR מתחת לנמוך שלו, בחלון של 10 ימים. הפיצול לאימון/בדיקה כרונולוגי
-(ללא זליגת עתיד).
+הדפוס נותן את הסיגנל; המודל מחליט **לקחת או לדלג**. כל עסקה מדומה
+(כניסה בפריצת הטריגר, סטופ 1R מתחת לנמוך הנסיגה, יעד 2R, יציאת זמן
+אחרי 15 יום, עלויות 10bps) מקבלת תוצאה ב-R, ואנסמבל של רגרסורים
+(HistGradientBoosting, 5 seeds) לומד לחזות את ה-R הצפוי מתוך הפיצ'רים —
+כולם ידועים בזמן ההחלטה:
+
+- **דפוס**: עומק ריטרייס, אורך נסיגה, יחס מחזורים, rvol של האימפולס,
+  שיפוע נפח בנסיגה, מיקום הסגירה בנר האחרון, RSI, מרחק מ-EMA10/20, ATR
+- **הקשר מניה**: מרחק משיא 52 שבועות, חוזק יחסי מול SPY (63 יום)
+- **הקשר שוק**: מגמת SPY מול SMA200/SMA50, תשואת SPY 20 יום,
+  רמת VIX ואחוזון VIX שנתי
+
+סף הכניסה נבחר לפי מקסימום תוחלת (avg R) על סט האימון מתוך רשת
+קוונטיילים, ונשמר יחד עם המודל.
+
+## תוצאות walk-forward (S&P 500, 2016–2026)
+
+הערכה כרונולוגית אמיתית: לכל שנת בדיקה המודל אומן רק על שנים קודמות
+(עם purge בגבול), והסף נבחר על האימון בלבד. על 5,832 עסקאות:
+
+| | בסיס (כל העסקאות) | מסונן (המודל) |
+|---|---|---|
+| תוחלת לעסקה | ‎+0.062R | **+0.156R** |
+| שנים מנצחות | — | **9/9** |
+| bootstrap p-value | — | **0.039** |
+
+המודל הוכיח ערך עקבי מחוץ למדגם. עדיין: ביצועי עבר אינם ערובה לעתיד,
+היקום סובל מהטיית שרידות (S&P 500 של היום), והתוחלת רגישה לעלויות בפועל.
 
 לבדיקה מקומית ללא רשת יש מחולל נתונים סינתטיים:
 

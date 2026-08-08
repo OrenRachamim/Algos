@@ -10,3 +10,4 @@ bt_*.log
 eval_*.log
 trades_*.json
 eval_*.json
+predict_today.txt
