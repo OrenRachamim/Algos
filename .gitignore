@@ -14,3 +14,6 @@ predict_today.txt
 sweep_*.log
 sweep_results.json
 final_run.log
+port_*.json
+portfolio.log
+equity_curve.png
