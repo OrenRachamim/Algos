@@ -698,18 +698,19 @@ R_CLIP = 3.0  # clip training target to +-3R so outliers don't dominate
 QUANTILE_GRID = (0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
 
 
-def _pick_threshold(pred_train, r_train, min_trades=100):
-    """Choose the predicted-R cutoff (from train quantiles) that maximizes
-    TOTAL train R - i.e. cut trades only when dropping them adds money.
-    With a strong pattern configuration this often selects no cutoff at
-    all (-inf), which is the honest answer: take every signal."""
-    best_thr, best_sum = -np.inf, r_train.sum()
+def _pick_threshold(pred, r, min_trades=100):
+    """Choose the predicted-R cutoff (from quantiles of pred) that
+    maximizes TOTAL R on (pred, r) - i.e. cut trades only when dropping
+    them adds money. Returns (threshold, quantile); (-inf, None) means no
+    cutoff beats taking every signal, which with a strong pattern
+    configuration is often the honest answer."""
+    best_thr, best_q, best_sum = -np.inf, None, r.sum()
     for q in QUANTILE_GRID:
-        thr = np.quantile(pred_train, q)
-        sel = pred_train >= thr
-        if sel.sum() >= min_trades and r_train[sel].sum() > best_sum:
-            best_sum, best_thr = r_train[sel].sum(), thr
-    return best_thr  # -inf = no filtering beats taking every trade
+        thr = np.quantile(pred, q)
+        sel = pred >= thr
+        if sel.sum() >= min_trades and r[sel].sum() > best_sum:
+            best_sum, best_thr, best_q = r[sel].sum(), thr, q
+    return best_thr, best_q
 
 
 def cmd_evaluate(args):
@@ -754,7 +755,7 @@ def cmd_evaluate(args):
             continue
         model = _make_model()
         model.fit(X[train], np.clip(r[train], -R_CLIP, R_CLIP))
-        thr = _pick_threshold(model.predict(X[train]), r[train])
+        thr, _ = _pick_threshold(model.predict(X[train]), r[train])
 
         pred = model.predict(X[test])
         sel = pred >= thr
@@ -884,18 +885,23 @@ def cmd_train(args):
     print(f"holdout (last 25%): IC {ic:+.3f}, top-30% avg R "
           f"{r[split:][top].mean():+.3f} vs {r[split:].mean():+.3f} all")
 
+    # pick the cutoff on the chronological validation tail (fit on the
+    # first 75%, select on the last 25%) - an in-sample pick looks
+    # brilliant and validates nothing
+    _, q = _pick_threshold(pred_h, r[split:], min_trades=50)
+
     model = _make_model()
     model.fit(X, np.clip(r, -R_CLIP, R_CLIP))
-    thr = _pick_threshold(model.predict(X), r)
-    if thr == -np.inf:
-        print("no cutoff beats taking every trade in-sample -> "
+    if q is None:
+        thr = -np.inf
+        print("no cutoff beats taking every trade on validation -> "
               "threshold disabled (all signals TAKE); expected R still "
               "ranks setups for prioritization")
     else:
+        thr = float(np.quantile(model.predict(X), q))
         sel = model.predict(X) >= thr
-        print(f"threshold (total-R max, in-sample): predicted R >= {thr:+.3f} "
-              f"-> {sel.sum()} trades, avg R {r[sel].mean():+.3f} "
-              f"(vs {r.mean():+.3f} unfiltered)")
+        print(f"threshold (total-R max on validation, q={q}): predicted R "
+              f">= {thr:+.3f} -> keeps {sel.mean():.0%} of trades")
 
     dump({"model": model, "features": FEATURE_NAMES, "params": p,
           "threshold": float(thr)}, MODEL_PATH)
