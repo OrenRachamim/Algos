@@ -89,21 +89,32 @@ def main():
         means = []
         for run in range(n_runs):
             rs = []
-            while len(rs) < n_trades:
+            i = 0
+            attempts = 0
+            while len(rs) < n_trades and i < n_trades:
                 t = names[rng.integers(len(names))]
                 arr = data[t]
                 if species == "uniform":
-                    k = rng.integers(60, len(arr["c"]) - 2)
+                    k = rng.integers(1, len(arr["c"]) - 2)
                 else:
-                    d = strat_dates[len(rs)]
+                    attempts += 1
+                    if attempts > 50:  # no ticker has data for this date
+                        i += 1
+                        attempts = 0
+                        continue
+                    d = strat_dates[i]
                     pos = date_pos[t].index.searchsorted(d)
-                    if pos >= len(arr["c"]) - 2 or pos < 60:
+                    if pos < 1 or pos >= len(arr["c"]) - 2:
                         continue
                     k = pos
                 r = sim(arr, int(k), float(rng.choice(risk_dist)))
                 if r is not None:
                     rs.append(r)
+                    i += 1
+                    attempts = 0
             means.append(np.mean(rs))
+            if (run + 1) % 20 == 0:
+                print(f"  ...{species} {run + 1}/{n_runs}", flush=True)
         means = np.array(means)
         strat_avg = strat["outcome_r"].mean()
         pval = float((means >= strat_avg).mean())
