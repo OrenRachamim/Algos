@@ -1,14 +1,17 @@
 {
   "impulse_days": 10,
-  "impulse_min_gain": 0.05,
-  "impulse_min_green": 0.55,
-  "impulse_min_rvol": 1.2,
+  "impulse_min_gain": 0.04,
+  "impulse_min_green": 0.50,
+  "impulse_min_rvol": 1.5,
   "pullback_min_len": 1,
   "pullback_max_len": 4,
   "max_retrace": 0.618,
   "vol_contraction": 1.10,
-  "confirm_within": 5,
+  "confirm_within": 8,
   "label_horizon": 10,
   "label_target_atr": 1.5,
-  "label_stop_atr": 1.0
+  "label_stop_atr": 1.0,
+  "trade_target_r": 3.0,
+  "trade_max_hold": 25,
+  "trade_cost_bps": 10.0
 }

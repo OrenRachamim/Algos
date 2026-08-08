@@ -30,21 +30,25 @@ MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mp_model.
 
 # ---------------------------------------------------------------- parameters
 
+# Defaults are the winning configuration from the 2016-2022 train /
+# 2023+ holdout parameter sweep (see sweep.py): high-volume impulses
+# (rvol >= 1.5) with a wide 3R target and patient 25d hold dominated
+# every alternative on both train and holdout expectancy.
 DEFAULTS = dict(
     impulse_days=10,        # lookback window for the impulse leg
-    impulse_min_gain=0.05,  # leg must gain >= 5%
-    impulse_min_green=0.55, # >= 55% of leg candles close up
-    impulse_min_rvol=1.2,   # leg avg volume >= 1.2x the 20d avg volume before the leg
+    impulse_min_gain=0.04,  # leg must gain >= 4%
+    impulse_min_green=0.50, # >= 50% of leg candles close up
+    impulse_min_rvol=1.5,   # leg avg volume >= 1.5x the 20d avg volume before the leg
     pullback_min_len=1,
     pullback_max_len=4,
     max_retrace=0.618,      # pullback may retrace <= 61.8% of the leg
     vol_contraction=1.10,   # pullback avg volume <= 110% of impulse avg volume
-    confirm_within=5,       # breakout must happen within N days to "confirm"
+    confirm_within=8,       # breakout must happen within N days to "confirm"
     label_horizon=10,       # days ahead used to label success for the model
     label_target_atr=1.5,   # success = +1.5 ATR above pullback high ...
     label_stop_atr=1.0,     # ... before -1.0 ATR below pullback low
-    trade_target_r=2.0,     # backtest: profit target in R (0 = time exit only)
-    trade_max_hold=15,      # backtest: max holding days after entry
+    trade_target_r=3.0,     # backtest: profit target in R (0 = time exit only)
+    trade_max_hold=25,      # backtest: max holding days after entry
     trade_cost_bps=10.0,    # backtest: round-trip cost+slippage in basis points
 )
 
@@ -691,19 +695,21 @@ def _make_model():
 
 R_CLIP = 3.0  # clip training target to +-3R so outliers don't dominate
 
-QUANTILE_GRID = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8)  # candidate keep-above cuts
+QUANTILE_GRID = (0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
 
 
 def _pick_threshold(pred_train, r_train, min_trades=100):
     """Choose the predicted-R cutoff (from train quantiles) that maximizes
-    train avg R with at least min_trades selected."""
-    best_thr, best_avg = -np.inf, r_train.mean()
+    TOTAL train R - i.e. cut trades only when dropping them adds money.
+    With a strong pattern configuration this often selects no cutoff at
+    all (-inf), which is the honest answer: take every signal."""
+    best_thr, best_sum = -np.inf, r_train.sum()
     for q in QUANTILE_GRID:
         thr = np.quantile(pred_train, q)
         sel = pred_train >= thr
-        if sel.sum() >= min_trades and r_train[sel].mean() > best_avg:
-            best_avg, best_thr = r_train[sel].mean(), thr
-    return best_thr  # -inf = no filtering beats the baseline on train
+        if sel.sum() >= min_trades and r_train[sel].sum() > best_sum:
+            best_sum, best_thr = r_train[sel].sum(), thr
+    return best_thr  # -inf = no filtering beats taking every trade
 
 
 def cmd_evaluate(args):
@@ -882,12 +888,14 @@ def cmd_train(args):
     model.fit(X, np.clip(r, -R_CLIP, R_CLIP))
     thr = _pick_threshold(model.predict(X), r)
     if thr == -np.inf:
-        print("no filtering threshold beat the baseline in-sample; saving thr=0")
-        thr = 0.0
-    sel = model.predict(X) >= thr
-    print(f"threshold (EV-max, in-sample): predicted R >= {thr:+.3f} -> "
-          f"{sel.sum()} trades, avg R {r[sel].mean():+.3f} "
-          f"(vs {r.mean():+.3f} unfiltered)")
+        print("no cutoff beats taking every trade in-sample -> "
+              "threshold disabled (all signals TAKE); expected R still "
+              "ranks setups for prioritization")
+    else:
+        sel = model.predict(X) >= thr
+        print(f"threshold (total-R max, in-sample): predicted R >= {thr:+.3f} "
+              f"-> {sel.sum()} trades, avg R {r[sel].mean():+.3f} "
+              f"(vs {r.mean():+.3f} unfiltered)")
 
     dump({"model": model, "features": FEATURE_NAMES, "params": p,
           "threshold": float(thr)}, MODEL_PATH)
