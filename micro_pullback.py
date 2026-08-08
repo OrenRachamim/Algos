@@ -214,6 +214,10 @@ def detect_events(df: pd.DataFrame, p: dict = DEFAULTS, market=None):
             slope20=float(slope20[pb_end]),
             atr_pct=float(atr / c[pb_end]),
             green_ratio=float(green_ratio),
+            # where the last pullback candle closed within its range:
+            # near the high = buyers stepping back in (bullish)
+            pb_close_pos=float((c[pb_end] - lo_[pb_end])
+                               / max(h[pb_end] - lo_[pb_end], 1e-9)),
             dist_52w=float(c[pb_end] / hi252[pb_end] - 1)
             if not np.isnan(hi252[pb_end]) else np.nan,
             rs_63=float(ret63[pb_end]) if not np.isnan(ret63[pb_end]) else np.nan,
@@ -278,7 +282,7 @@ def detect_events(df: pd.DataFrame, p: dict = DEFAULTS, market=None):
 FEATURE_NAMES = [
     "leg_gain", "retrace", "pb_len", "pb_vol_ratio", "impulse_rvol",
     "pb_vol_slope", "rsi14", "dist_ema10", "dist_ema20", "slope20",
-    "atr_pct", "green_ratio",
+    "atr_pct", "green_ratio", "pb_close_pos",
     # phase 3: stock context + market regime
     "dist_52w", "rs_63", "spy_trend200", "spy_above50", "spy_ret20",
     "vix_level", "vix_pctl",
@@ -649,15 +653,55 @@ def _clean_X(X: np.ndarray) -> np.ndarray:
     return X
 
 
-def _make_classifier():
-    from sklearn.calibration import CalibratedClassifierCV
-    from sklearn.ensemble import HistGradientBoostingClassifier
+class REnsemble:
+    """Small seed-ensemble of gradient boosting regressors predicting the
+    trade's R outcome (meta-labeling by expected value). Ranking by
+    predicted R separates far better than a calibrated win/loss classifier
+    on this data - probabilities compress around the base rate while R
+    magnitudes keep the ordering information. Averaging across seeds
+    stabilizes the ranking."""
 
-    base = HistGradientBoostingClassifier(
-        max_iter=300, learning_rate=0.05, max_depth=3,
-        min_samples_leaf=40, l2_regularization=1.0, random_state=42,
-    )
-    return CalibratedClassifierCV(base, cv=3, method="sigmoid")
+    N_SEEDS = 5
+
+    def __init__(self):
+        from sklearn.ensemble import HistGradientBoostingRegressor
+
+        self.models = [
+            HistGradientBoostingRegressor(
+                max_iter=300, learning_rate=0.05, max_depth=3,
+                min_samples_leaf=40, l2_regularization=1.0, random_state=s,
+            )
+            for s in range(self.N_SEEDS)
+        ]
+
+    def fit(self, X, y):
+        for m in self.models:
+            m.fit(X, y)
+        return self
+
+    def predict(self, X):
+        return np.mean([m.predict(X) for m in self.models], axis=0)
+
+
+def _make_model():
+    return REnsemble()
+
+
+R_CLIP = 3.0  # clip training target to +-3R so outliers don't dominate
+
+QUANTILE_GRID = (0.3, 0.4, 0.5, 0.6, 0.7, 0.8)  # candidate keep-above cuts
+
+
+def _pick_threshold(pred_train, r_train, min_trades=100):
+    """Choose the predicted-R cutoff (from train quantiles) that maximizes
+    train avg R with at least min_trades selected."""
+    best_thr, best_avg = -np.inf, r_train.mean()
+    for q in QUANTILE_GRID:
+        thr = np.quantile(pred_train, q)
+        sel = pred_train >= thr
+        if sel.sum() >= min_trades and r_train[sel].mean() > best_avg:
+            best_avg, best_thr = r_train[sel].mean(), thr
+    return best_thr  # -inf = no filtering beats the baseline on train
 
 
 def cmd_evaluate(args):
@@ -684,12 +728,13 @@ def cmd_evaluate(args):
 
     X = _clean_X(data[[f"f_{k}" for k in FEATURE_NAMES]].to_numpy(float))
     r = data["outcome_r"].to_numpy(float)
-    y = (r > 0).astype(int)
     years = data["entry_date"].str[:4].to_numpy()
     dates = data["entry_date"].to_numpy()
 
     print(f"\ntrades: {len(data)}  years {years.min()}-{years.max()}  "
-          f"baseline: win {y.mean():.1%}, avg R {r.mean():+.3f}")
+          f"baseline: win {(r > 0).mean():.1%}, avg R {r.mean():+.3f}")
+
+    from scipy.stats import spearmanr
 
     folds = []
     for ty in sorted(set(years)):
@@ -699,46 +744,52 @@ def cmd_evaluate(args):
         test = years == ty
         if train.sum() < 400 or test.sum() < 30:
             continue
-        model = _make_classifier()
-        model.fit(X[train], y[train])
-        p_tr = model.predict_proba(X[train])[:, 1]
+        model = _make_model()
+        model.fit(X[train], np.clip(r[train], -R_CLIP, R_CLIP))
+        thr = _pick_threshold(model.predict(X[train]), r[train])
 
-        best_t, best_avg = 0.5, -np.inf
-        for t in np.arange(0.40, 0.725, 0.025):
-            sel = p_tr >= t
-            if sel.sum() >= 100:
-                avg = r[train][sel].mean()
-                if avg > best_avg:
-                    best_avg, best_t = avg, t
-
-        p_te = model.predict_proba(X[test])[:, 1]
-        sel = p_te >= best_t
+        pred = model.predict(X[test])
+        sel = pred >= thr
+        ic = spearmanr(pred, r[test]).statistic if test.sum() > 10 else np.nan
         folds.append(dict(
-            year=ty, thr=round(float(best_t), 3),
+            year=ty, thr=None if thr == -np.inf else round(float(thr), 3),
+            ic=round(float(ic), 3),
             base_n=int(test.sum()), base_avg=float(r[test].mean()),
             filt_n=int(sel.sum()),
             filt_avg=float(r[test][sel].mean()) if sel.any() else np.nan,
             filt_sum=float(r[test][sel].sum()),
+            _sel_r=r[test][sel],
         ))
 
     if not folds:
         sys.exit("not enough history for walk-forward folds")
 
-    print("\nyear   thr   base_n baseAvgR   filt_n filtAvgR   filtSumR")
+    print("\nyear    thr      IC   base_n baseAvgR   filt_n filtAvgR   filtSumR")
     for f in folds:
-        print(f"{f['year']}  {f['thr']:.3f}   {f['base_n']:5d}  {f['base_avg']:+.3f}"
-              f"    {f['filt_n']:5d}   {f['filt_avg']:+.3f}   {f['filt_sum']:+8.1f}")
+        thr = "  none" if f["thr"] is None else f"{f['thr']:+.3f}"
+        print(f"{f['year']}  {thr}  {f['ic']:+.3f}   {f['base_n']:5d}  "
+              f"{f['base_avg']:+.3f}    {f['filt_n']:5d}   {f['filt_avg']:+.3f}"
+              f"   {f['filt_sum']:+8.1f}")
 
-    base_all = np.concatenate([r[years == f["year"]] for f in folds])
-    filt_years = [f for f in folds if f["filt_n"] > 0]
-    filt_avg = (sum(f["filt_sum"] for f in filt_years)
-                / sum(f["filt_n"] for f in filt_years))
+    oos_years = [f["year"] for f in folds]
+    base_all = r[np.isin(years, oos_years)]
+    filt_r = np.concatenate([f.pop("_sel_r") for f in folds])
+    filt_avg = filt_r.mean() if len(filt_r) else np.nan
     improved = sum(1 for f in folds
                    if f["filt_n"] > 0 and f["filt_avg"] > f["base_avg"])
     print(f"\nOOS pooled:  baseline avg R {base_all.mean():+.3f} "
           f"({len(base_all)} trades)  |  filtered avg R {filt_avg:+.3f} "
-          f"({sum(f['filt_n'] for f in folds)} trades)")
+          f"({len(filt_r)} trades)")
     print(f"years where filter beat baseline: {improved}/{len(folds)}")
+
+    # bootstrap: how often would random subsets of the same size do as well?
+    rng = np.random.default_rng(0)
+    boot = np.array([
+        rng.choice(base_all, size=len(filt_r), replace=True).mean()
+        for _ in range(5000)
+    ])
+    pval = float((boot >= filt_avg).mean())
+    print(f"bootstrap p-value (random subset >= filtered avg): {pval:.4f}")
 
     if args.json:
         with open(args.json, "w") as f:
@@ -793,7 +844,6 @@ def cmd_train(args):
     """Train the final meta-labeling model on realized trades and pick the
     EV-maximizing probability threshold; both are saved with the model."""
     from joblib import dump
-    from sklearn.metrics import roc_auc_score
 
     p = build_params(args)
     if args.dataset and os.path.exists(args.dataset):
@@ -811,34 +861,34 @@ def cmd_train(args):
 
     X = _clean_X(data[[f"f_{k}" for k in FEATURE_NAMES]].to_numpy(float))
     r = data["outcome_r"].to_numpy(float)
-    y = (r > 0).astype(int)
 
     # holdout report (chronological last 25%) before refitting on everything
-    split = int(len(y) * 0.75)
-    hold = _make_classifier()
-    hold.fit(X[:split], y[:split])
-    proba = hold.predict_proba(X[split:])[:, 1]
-    auc = roc_auc_score(y[split:], proba) if len(set(y[split:])) > 1 else float("nan")
-    print(f"trades: {len(y)}  baseline win {y.mean():.1%}, avg R {r.mean():+.3f}")
-    print(f"holdout AUC (last 25%): {auc:.3f}")
+    from scipy.stats import spearmanr
 
-    model = _make_classifier()
-    model.fit(X, y)
-    p_all = model.predict_proba(X)[:, 1]
-    best_t, best_avg = 0.5, -np.inf
-    for t in np.arange(0.40, 0.725, 0.025):
-        sel = p_all >= t
-        if sel.sum() >= 100:
-            avg = r[sel].mean()
-            if avg > best_avg:
-                best_avg, best_t = avg, t
-    sel = p_all >= best_t
-    print(f"threshold (EV-max, in-sample): {best_t:.3f} -> "
+    split = int(len(r) * 0.75)
+    hold = _make_model()
+    hold.fit(X[:split], np.clip(r[:split], -R_CLIP, R_CLIP))
+    pred_h = hold.predict(X[split:])
+    ic = spearmanr(pred_h, r[split:]).statistic
+    top = pred_h >= np.quantile(pred_h, 0.7)
+    print(f"trades: {len(r)}  baseline win {(r > 0).mean():.1%}, "
+          f"avg R {r.mean():+.3f}")
+    print(f"holdout (last 25%): IC {ic:+.3f}, top-30% avg R "
+          f"{r[split:][top].mean():+.3f} vs {r[split:].mean():+.3f} all")
+
+    model = _make_model()
+    model.fit(X, np.clip(r, -R_CLIP, R_CLIP))
+    thr = _pick_threshold(model.predict(X), r)
+    if thr == -np.inf:
+        print("no filtering threshold beat the baseline in-sample; saving thr=0")
+        thr = 0.0
+    sel = model.predict(X) >= thr
+    print(f"threshold (EV-max, in-sample): predicted R >= {thr:+.3f} -> "
           f"{sel.sum()} trades, avg R {r[sel].mean():+.3f} "
           f"(vs {r.mean():+.3f} unfiltered)")
 
     dump({"model": model, "features": FEATURE_NAMES, "params": p,
-          "threshold": float(best_t)}, MODEL_PATH)
+          "threshold": float(thr)}, MODEL_PATH)
     print(f"saved model (params + threshold) -> {MODEL_PATH}")
 
 
@@ -871,11 +921,13 @@ def cmd_predict(args):
         for ev in events:
             x = np.array([[ev["features"].get(k, np.nan)
                            for k in bundle["features"]]], dtype=float)
-            prob = model.predict_proba(x)[0, 1]
-            verdict = "TAKE" if prob >= threshold else "skip"
+            x = np.nan_to_num(x, nan=0.0)
+            pred_r = model.predict(x)[0]
+            verdict = "TAKE" if pred_r >= threshold else "skip"
             found = True
             print(f"{name}: ACTIVE pullback ended {ev['date_pb_end']} | "
-                  f"P(win) = {prob:.1%} -> {verdict} (thr {threshold:.2f})")
+                  f"expected R = {pred_r:+.2f} -> {verdict} "
+                  f"(thr {threshold:+.2f})")
             print(f"   entry trigger > {ev['pb_high']}, stop < {ev['pb_low']}, "
                   f"retrace {ev['retrace']:.0%}, len {ev['pb_len']}d")
     if not found:
