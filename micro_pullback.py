@@ -77,6 +77,8 @@ def explicit_cli_params(args) -> dict:
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if "hi252" in df.columns:  # already computed (idempotent)
+        return df
     df = df.copy()
     close, high, low = df["Close"], df["High"], df["Low"]
 
