@@ -3,3 +3,9 @@ test_data/
 test_data_live.csv
 mp_model.joblib
 *.pyc
+cache/
+sp500.txt
+bt_*.json
+bt_*.log
+trades_*.json
+eval_*.json

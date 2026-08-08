@@ -43,10 +43,13 @@ DEFAULTS = dict(
     label_horizon=10,       # days ahead used to label success for the model
     label_target_atr=1.5,   # success = +1.5 ATR above pullback high ...
     label_stop_atr=1.0,     # ... before -1.0 ATR below pullback low
+    trade_target_r=2.0,     # backtest: profit target in R (0 = time exit only)
+    trade_max_hold=15,      # backtest: max holding days after entry
+    trade_cost_bps=10.0,    # backtest: round-trip cost+slippage in basis points
 )
 
 INT_PARAMS = {"impulse_days", "pullback_min_len", "pullback_max_len",
-              "confirm_within", "label_horizon"}
+              "confirm_within", "label_horizon", "trade_max_hold"}
 
 
 def build_params(args) -> dict:
@@ -95,128 +98,156 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["atr14"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
 
     df["slope20"] = df["ema20"].pct_change(5)  # 5-day slope of EMA20
+    df["hi252"] = high.rolling(252, min_periods=60).max()
+    df["ret63"] = close.pct_change(63)
     return df
 
 
 # ---------------------------------------------------------------- detection
 
 
-def _is_red_or_small(row, atr):
-    """Pullback candle: closes down, or a small-bodied candle (< 0.5 ATR)."""
-    body = abs(row["Close"] - row["Open"])
-    return row["Close"] < row["Open"] or body < 0.5 * atr
-
-
-def detect_events(df: pd.DataFrame, p: dict = DEFAULTS):
+def detect_events(df: pd.DataFrame, p: dict = DEFAULTS, market=None):
     """Return a list of pattern events found in df.
 
     Each event dict has: leg_start/leg_end/pb_end indices, status
     ('confirmed' | 'failed' | 'active'), feature values, and (when the
     future window is available) a success label for model training.
+    Pass `market` (from load_market) to add regime/RS features.
     """
     df = add_indicators(df)
+    o = df["Open"].to_numpy(float)
+    h = df["High"].to_numpy(float)
+    lo_ = df["Low"].to_numpy(float)
+    c = df["Close"].to_numpy(float)
+    vol = df["Volume"].to_numpy(float)
+    ema10 = df["ema10"].to_numpy(float)
+    ema20 = df["ema20"].to_numpy(float)
+    sma50 = df["sma50"].to_numpy(float)
+    vol20 = df["vol_sma20"].to_numpy(float)
+    rsi = df["rsi14"].to_numpy(float)
+    atr14 = df["atr14"].to_numpy(float)
+    slope20 = df["slope20"].to_numpy(float)
+    hi252 = df["hi252"].to_numpy(float)
+    ret63 = df["ret63"].to_numpy(float)
+    green = c > o
+    body = np.abs(c - o)
+
     events = []
     n = len(df)
-    i = p["impulse_days"] + 50  # room for indicators to warm up
+    L = p["impulse_days"]
+    i = L + 50  # room for indicators to warm up
 
     while i < n - 1:
-        leg_start_i = i - p["impulse_days"]
-        leg = df.iloc[leg_start_i: i + 1]
-        leg_gain = leg["Close"].iloc[-1] / leg["Close"].iloc[0] - 1
-        green_ratio = (leg["Close"] > leg["Open"]).mean()
-        row = df.iloc[i]
+        ls = i - L  # leg start index; leg spans [ls, i]
+        leg_gain = c[i] / c[ls] - 1
+        green_ratio = green[ls: i + 1].mean()
 
         # impulse volume quality: leg volume relative to the 20d average
         # volume *before* the leg started (so the leg doesn't inflate its
         # own baseline)
-        base_vol = df["vol_sma20"].iloc[leg_start_i]
-        impulse_rvol = (
-            leg["Volume"].mean() / base_vol
-            if base_vol and not np.isnan(base_vol) else 1.0
-        )
+        base_vol = vol20[ls]
+        leg_vol = vol[ls: i + 1].mean()
+        impulse_rvol = leg_vol / base_vol if base_vol and not np.isnan(base_vol) else 1.0
 
         trend_ok = (
             leg_gain >= p["impulse_min_gain"]
             and green_ratio >= p["impulse_min_green"]
             and impulse_rvol >= p["impulse_min_rvol"]
-            and row["Close"] > row["ema20"]
-            and (np.isnan(row["sma50"]) or row["Close"] > row["sma50"])
+            and c[i] > ema20[i]
+            and (np.isnan(sma50[i]) or c[i] > sma50[i])
         )
         if not trend_ok:
             i += 1
             continue
 
-        leg_high = leg["High"].max()
-        leg_low = leg["Low"].min()
+        leg_high = h[ls: i + 1].max()
+        leg_low = lo_[ls: i + 1].min()
         leg_range = max(leg_high - leg_low, 1e-9)
-        atr = row["atr14"]
+        atr = atr14[i]
 
-        # ---- walk forward through a candidate pullback
+        # ---- walk forward through a candidate pullback: red or small
+        # candles that don't make new highs
         j = i + 1
-        pb_rows = []
         while (
             j < n
-            and len(pb_rows) < p["pullback_max_len"]
-            and _is_red_or_small(df.iloc[j], atr)
-            and df.iloc[j]["High"] <= leg_high * 1.002  # not making new highs
+            and j - (i + 1) < p["pullback_max_len"]
+            and (not green[j] or body[j] < 0.5 * atr)
+            and h[j] <= leg_high * 1.002
         ):
-            pb_rows.append(j)
             j += 1
-
-        if len(pb_rows) < p["pullback_min_len"]:
+        pb_len = j - (i + 1)
+        if pb_len < p["pullback_min_len"]:
             i += 1
             continue
 
-        pb = df.iloc[pb_rows]
-        pb_low = pb["Low"].min()
-        pb_high = pb["High"].max()
+        pb_s, pb_end = i + 1, j - 1
+        pb_low = lo_[pb_s: j].min()
+        pb_high = h[pb_s: j].max()
         retrace = (leg_high - pb_low) / leg_range
-        impulse_vol = leg["Volume"].mean()
-        pb_vol_ratio = pb["Volume"].mean() / max(impulse_vol, 1)
+        pb_vol = vol[pb_s: j]
+        pb_vol_ratio = pb_vol.mean() / max(leg_vol, 1)
 
         # volume trend inside the pullback: negative slope = sellers drying
         # up (bullish), positive = selling pressure building (bearish)
-        v = pb["Volume"].to_numpy(dtype=float)
-        if len(v) >= 2 and v.mean() > 0:
-            pb_vol_slope = float(np.polyfit(np.arange(len(v)), v / v.mean(), 1)[0])
+        if pb_len >= 2 and pb_vol.mean() > 0:
+            pb_vol_slope = float(np.polyfit(np.arange(pb_len),
+                                            pb_vol / pb_vol.mean(), 1)[0])
         else:
             pb_vol_slope = 0.0
 
-        shallow_ok = retrace <= p["max_retrace"] and pb_low > df.iloc[i]["ema20"] * 0.985
+        shallow_ok = retrace <= p["max_retrace"] and pb_low > ema20[i] * 0.985
         vol_ok = pb_vol_ratio <= p["vol_contraction"]
         if not (shallow_ok and vol_ok):
             i += 1
             continue
 
-        pb_end = pb_rows[-1]
+        features = dict(
+            leg_gain=float(leg_gain),
+            retrace=float(retrace),
+            pb_len=float(pb_len),
+            pb_vol_ratio=float(pb_vol_ratio),
+            impulse_rvol=float(impulse_rvol),
+            pb_vol_slope=float(pb_vol_slope),
+            rsi14=float(rsi[pb_end]),
+            dist_ema10=float(c[pb_end] / ema10[pb_end] - 1),
+            dist_ema20=float(c[pb_end] / ema20[pb_end] - 1),
+            slope20=float(slope20[pb_end]),
+            atr_pct=float(atr / c[pb_end]),
+            green_ratio=float(green_ratio),
+            dist_52w=float(c[pb_end] / hi252[pb_end] - 1)
+            if not np.isnan(hi252[pb_end]) else np.nan,
+            rs_63=float(ret63[pb_end]) if not np.isnan(ret63[pb_end]) else np.nan,
+        )
+        features.update(market_features(market, df.index[pb_end]))
+        if not np.isnan(features["rs_63"]) and not np.isnan(features.get("spy_ret63", np.nan)):
+            features["rs_63"] -= features["spy_ret63"]  # relative strength vs SPY
+
         event = dict(
-            leg_start=int(i - p["impulse_days"]),
+            leg_start=int(ls),
             leg_end=int(i),
             pb_end=int(pb_end),
             date_leg_end=str(df.index[i].date()),
             date_pb_end=str(df.index[pb_end].date()),
             leg_gain=round(float(leg_gain), 4),
-            pb_len=len(pb_rows),
+            pb_len=pb_len,
             retrace=round(float(retrace), 3),
             pb_vol_ratio=round(float(pb_vol_ratio), 3),
             impulse_rvol=round(float(impulse_rvol), 2),
             pb_vol_slope=round(pb_vol_slope, 3),
-            pb_high=round(float(pb_high), 2),
-            pb_low=round(float(pb_low), 2),
+            pb_high=round(float(pb_high), 4),
+            pb_low=round(float(pb_low), 4),
+            features=features,
         )
-        event["features"] = extract_features(df, i, pb_rows, leg_gain, retrace,
-                                             pb_vol_ratio, impulse_rvol,
-                                             pb_vol_slope, p)
 
         # ---- outcome: does a breakout above pb_high happen within confirm_within days?
         status, label = "active", None
         fw_start = pb_end + 1
         confirm_idx = None
         for k in range(fw_start, min(fw_start + p["confirm_within"], n)):
-            if df.iloc[k]["Low"] < pb_low - p["label_stop_atr"] * atr:
+            if lo_[k] < pb_low - p["label_stop_atr"] * atr:
                 status = "failed"
                 break
-            if df.iloc[k]["Close"] > pb_high:
+            if c[k] > pb_high:
                 status, confirm_idx = "confirmed", k
                 break
         if status == "active" and fw_start + p["confirm_within"] <= n:
@@ -225,14 +256,13 @@ def detect_events(df: pd.DataFrame, p: dict = DEFAULTS):
         # ---- training label: after pullback end, +1.5 ATR before -1.0 ATR?
         target = pb_high + p["label_target_atr"] * atr
         stop = pb_low - p["label_stop_atr"] * atr
-        horizon_end = min(pb_end + 1 + p["label_horizon"], n)
-        if pb_end + 1 + p["label_horizon"] <= n:
+        if fw_start + p["label_horizon"] <= n:
             label = 0
-            for k in range(pb_end + 1, horizon_end):
-                if df.iloc[k]["Low"] <= stop:
+            for k in range(fw_start, fw_start + p["label_horizon"]):
+                if lo_[k] <= stop:
                     label = 0
                     break
-                if df.iloc[k]["High"] >= target:
+                if h[k] >= target:
                     label = 1
                     break
 
@@ -249,49 +279,118 @@ FEATURE_NAMES = [
     "leg_gain", "retrace", "pb_len", "pb_vol_ratio", "impulse_rvol",
     "pb_vol_slope", "rsi14", "dist_ema10", "dist_ema20", "slope20",
     "atr_pct", "green_ratio",
+    # phase 3: stock context + market regime
+    "dist_52w", "rs_63", "spy_trend200", "spy_above50", "spy_ret20",
+    "vix_level", "vix_pctl",
 ]
 
+MARKET_KEYS = ["spy_trend200", "spy_above50", "spy_ret20", "spy_ret63",
+               "vix_level", "vix_pctl"]
 
-def extract_features(df, leg_end_i, pb_rows, leg_gain, retrace, pb_vol_ratio,
-                     impulse_rvol, pb_vol_slope, p):
-    last = df.iloc[pb_rows[-1]]
-    leg = df.iloc[leg_end_i - p["impulse_days"]: leg_end_i + 1]
-    close = last["Close"]
-    return dict(
-        leg_gain=float(leg_gain),
-        retrace=float(retrace),
-        pb_len=float(len(pb_rows)),
-        pb_vol_ratio=float(pb_vol_ratio),
-        impulse_rvol=float(impulse_rvol),
-        pb_vol_slope=float(pb_vol_slope),
-        rsi14=float(last["rsi14"]),
-        dist_ema10=float(close / last["ema10"] - 1),
-        dist_ema20=float(close / last["ema20"] - 1),
-        slope20=float(last["slope20"]),
-        atr_pct=float(last["atr14"] / close),
-        green_ratio=float((leg["Close"] > leg["Open"]).mean()),
-    )
+
+def load_market(period: str, cache_dir: str = None):
+    """Load SPY + VIX context series used for regime features."""
+    try:
+        spy = add_indicators_market(load_ticker("SPY", period, cache_dir))
+        vix = load_ticker("^VIX", period, cache_dir)
+        vix["pctl252"] = vix["Close"].rolling(252, min_periods=60).rank(pct=True)
+        return {"spy": spy, "vix": vix}
+    except Exception as e:
+        print(f"  [warn] market data unavailable ({e}) - regime features NaN",
+              file=sys.stderr)
+        return None
+
+
+def add_indicators_market(spy: pd.DataFrame) -> pd.DataFrame:
+    spy = spy.copy()
+    close = spy["Close"]
+    spy["sma50"] = close.rolling(50).mean()
+    spy["sma200"] = close.rolling(200).mean()
+    spy["ret20"] = close.pct_change(20)
+    spy["ret63"] = close.pct_change(63)
+    return spy
+
+
+def market_features(market, ts) -> dict:
+    """Regime features as of timestamp ts (NaN when unavailable)."""
+    out = {k: np.nan for k in MARKET_KEYS}
+    if not market:
+        return out
+    spy, vix = market["spy"], market["vix"]
+    i = spy.index.get_indexer([ts], method="pad")[0]
+    if i >= 0:
+        row = spy.iloc[i]
+        if not np.isnan(row["sma200"]):
+            out["spy_trend200"] = float(row["Close"] / row["sma200"] - 1)
+        if not np.isnan(row["sma50"]):
+            out["spy_above50"] = float(row["Close"] > row["sma50"])
+        out["spy_ret20"] = float(row["ret20"])
+        out["spy_ret63"] = float(row["ret63"])
+    j = vix.index.get_indexer([ts], method="pad")[0]
+    if j >= 0:
+        out["vix_level"] = float(vix["Close"].iloc[j])
+        out["vix_pctl"] = float(vix["pctl252"].iloc[j])
+    return out
 
 
 # ---------------------------------------------------------------- data I/O
 
 
-def load_ticker(ticker: str, period: str) -> pd.DataFrame:
-    try:
-        import logging
+PERIOD_DAYS = {"6mo": 126, "1y": 252, "2y": 504, "5y": 1260,
+               "10y": 2520, "max": 10 ** 9}
 
-        import yfinance as yf
 
-        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-        df = yf.download(ticker, period=period, interval="1d",
-                         progress=False, auto_adjust=True)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df.dropna()
-        if len(df):
-            return df
-    except Exception:
-        pass
+def _slice_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
+    days = PERIOD_DAYS.get(period)
+    if days is None:  # e.g. "3y" -> 3*252
+        try:
+            days = int(float(period.rstrip("y")) * 252)
+        except ValueError:
+            days = 10 ** 9
+    return df.iloc[-days:]
+
+
+def load_ticker(ticker: str, period: str, cache_dir: str = None) -> pd.DataFrame:
+    """Load daily bars, with an optional on-disk cache.
+
+    The cache always stores 10y of history; the requested period is sliced
+    from it. A cached file is reused if its last bar is < 4 days old.
+    """
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        path = os.path.join(cache_dir, f"{ticker.replace('^', '_')}.csv")
+        if os.path.exists(path):
+            df = pd.read_csv(path, parse_dates=["Date"], index_col="Date")
+            if len(df) and (pd.Timestamp.now() - df.index[-1]).days < 4:
+                return _slice_period(df, period)
+        df = _download(ticker, "10y")
+        df.to_csv(path)
+        return _slice_period(df, period)
+    return _download(ticker, period)
+
+
+_YF_BROKEN = False  # set after the first yfinance failure to skip it thereafter
+
+
+def _download(ticker: str, period: str) -> pd.DataFrame:
+    global _YF_BROKEN
+    if not _YF_BROKEN:
+        try:
+            import logging
+
+            import yfinance as yf
+
+            logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+            df = yf.download(ticker, period=period, interval="1d",
+                             progress=False, auto_adjust=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.dropna()
+            if len(df):
+                return df
+            _YF_BROKEN = True
+        except Exception:
+            _YF_BROKEN = True
     return _yahoo_chart_api(ticker, period)
 
 
@@ -301,15 +400,22 @@ def _yahoo_chart_api(ticker: str, period: str) -> pd.DataFrame:
     Works in environments where yfinance's curl_cffi transport fails
     (e.g. behind TLS-intercepting proxies).
     """
+    import time
+
     import requests
 
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-    r = requests.get(
-        url,
-        params={"range": period, "interval": "1d", "events": "div,split"},
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-        timeout=30,
-    )
+    for attempt in range(5):
+        r = requests.get(
+            url,
+            params={"range": period, "interval": "1d", "events": "div,split"},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            timeout=30,
+        )
+        if r.status_code == 429 and attempt < 4:  # rate limited - back off
+            time.sleep(2 ** attempt)
+            continue
+        break
     r.raise_for_status()
     res = r.json()["chart"]["result"][0]
     quote = res["indicators"]["quote"][0]
@@ -335,11 +441,12 @@ def load_csv(path: str) -> pd.DataFrame:
     return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
 
 
-def gather(tickers, period, csv):
-    """Yield (name, df) pairs from tickers and/or CSV files.
+def gather(tickers, period, csv, tickers_file=None, cache_dir=None):
+    """Yield (name, df) pairs from tickers, a tickers file and/or CSV files.
 
     --csv accepts a single file, a comma separated list, or a directory
-    (all *.csv files inside it are used).
+    (all *.csv files inside it are used).  --tickers-file is a text file
+    with one ticker per line (# comments allowed).
     """
     paths = []
     if csv:
@@ -353,24 +460,315 @@ def gather(tickers, period, csv):
                 paths.append(part)
     for path in paths:
         yield os.path.splitext(os.path.basename(path))[0], load_csv(path)
-    for t in tickers:
+
+    tickers = list(tickers)
+    if tickers_file:
+        with open(tickers_file) as f:
+            tickers += [ln.strip() for ln in f
+                        if ln.strip() and not ln.startswith("#")]
+    for k, t in enumerate(tickers):
         try:
-            df = load_ticker(t, period)
+            df = load_ticker(t, period, cache_dir)
             if len(df) >= 120:
                 yield t, df
             else:
                 print(f"  [skip] {t}: only {len(df)} rows", file=sys.stderr)
         except Exception as e:
             print(f"  [skip] {t}: {e}", file=sys.stderr)
+        if len(tickers) > 20 and (k + 1) % 50 == 0:
+            print(f"  ...loaded {k + 1}/{len(tickers)} tickers", file=sys.stderr)
+
+
+# ---------------------------------------------------------------- trading
+
+
+def simulate_trade(df: pd.DataFrame, ev: dict, p: dict):
+    """Simulate one trade from a detected event.
+
+    Entry: first day the High crosses the pullback high (buy-stop at the
+    trigger, or at the Open on a gap up).  Stop: pullback low.  Exit at
+    +trade_target_r * R, at the stop, or at the Close after trade_max_hold
+    days.  Round-trip costs are subtracted in R terms.  Intraday ambiguity
+    (both stop and target touched) resolves to the stop - conservative.
+
+    Returns None when the trigger never fires (or breaks down first).
+    """
+    n = len(df)
+    trigger, stop = ev["pb_high"], ev["pb_low"]
+    entry_i = None
+    for k in range(ev["pb_end"] + 1, min(ev["pb_end"] + 1 + p["confirm_within"], n)):
+        row = df.iloc[k]
+        if row["High"] > trigger:
+            entry_px = max(row["Open"], trigger)
+            entry_i = k
+            break
+        if row["Low"] <= stop:  # broke down before ever triggering
+            return None
+    if entry_i is None:
+        return None
+
+    risk = entry_px - stop
+    if risk <= 0 or risk / entry_px < 1e-4:
+        return None
+    target = entry_px + p["trade_target_r"] * risk if p["trade_target_r"] > 0 else None
+
+    exit_px, exit_i, reason = None, None, None
+    for k in range(entry_i, n):
+        row = df.iloc[k]
+        if row["Low"] <= stop:
+            exit_px = min(stop, row["Open"])  # gap through the stop fills lower
+            exit_i, reason = k, "stop"
+            break
+        if target is not None and row["High"] >= target:
+            exit_px = max(target, row["Open"]) if k > entry_i else target
+            exit_i, reason = k, "target"
+            break
+        if k - entry_i + 1 >= p["trade_max_hold"]:
+            exit_px, exit_i, reason = row["Close"], k, "time"
+            break
+    if exit_i is None:  # still open at end of data
+        exit_px, exit_i, reason = df.iloc[-1]["Close"], n - 1, "open"
+
+    cost_r = (p["trade_cost_bps"] / 1e4) * entry_px / risk
+    return dict(
+        entry_date=str(df.index[entry_i].date()),
+        exit_date=str(df.index[exit_i].date()),
+        entry_px=round(float(entry_px), 4),
+        exit_px=round(float(exit_px), 4),
+        risk=round(float(risk), 4),
+        reason=reason,
+        outcome_r=round(float((exit_px - entry_px) / risk - cost_r), 3),
+    )
+
+
+def backtest_stats(trades):
+    """Aggregate closed trades into performance stats."""
+    closed = [t for t in trades if t["reason"] != "open"]
+    if not closed:
+        return None
+    r = np.array([t["outcome_r"] for t in closed])
+    wins, losses = r[r > 0], r[r <= 0]
+    order = np.argsort([t["entry_date"] for t in closed])
+    equity = np.cumsum(r[order])
+    dd = float((np.maximum.accumulate(equity) - equity).max())
+    return dict(
+        trades=len(closed),
+        open_trades=len(trades) - len(closed),
+        win_rate=float((r > 0).mean()),
+        avg_r=float(r.mean()),
+        median_r=float(np.median(r)),
+        profit_factor=float(wins.sum() / -losses.sum()) if losses.sum() < 0 else float("inf"),
+        total_r=float(r.sum()),
+        max_drawdown_r=dd,
+        by_reason={k: int(sum(1 for t in closed if t["reason"] == k))
+                   for k in ("target", "stop", "time")},
+    )
+
+
+def print_stats(stats, title):
+    print(f"\n=== {title} ===")
+    print(f"trades: {stats['trades']}   (open/excluded: {stats['open_trades']})")
+    print(f"win rate: {stats['win_rate']:.1%}   avg R: {stats['avg_r']:+.3f}   "
+          f"median R: {stats['median_r']:+.3f}")
+    print(f"profit factor: {stats['profit_factor']:.2f}   total R: "
+          f"{stats['total_r']:+.1f}   max DD: {stats['max_drawdown_r']:.1f}R")
+    br = stats["by_reason"]
+    print(f"exits: target {br['target']} / stop {br['stop']} / time {br['time']}")
 
 
 # ---------------------------------------------------------------- commands
 
 
+def cmd_backtest(args):
+    p = build_params(args)
+    trades = []
+    n_events = 0
+    for name, df in gather(args.tickers, args.period, args.csv,
+                           args.tickers_file, args.cache_dir):
+        for ev in detect_events(df, p):
+            n_events += 1
+            tr = simulate_trade(df, ev, p)
+            if tr:
+                tr["ticker"] = name
+                trades.append(tr)
+
+    if not trades:
+        sys.exit("no trades simulated - relax parameters or add data")
+    stats = backtest_stats(trades)
+    print(f"\nevents detected: {n_events}, triggered trades: {len(trades)} "
+          f"({len(trades) / n_events:.0%})")
+    print_stats(stats, f"BACKTEST  target={p['trade_target_r']}R "
+                       f"stop=1R hold<={p['trade_max_hold']}d "
+                       f"costs={p['trade_cost_bps']}bps")
+
+    years = {}
+    for t in trades:
+        if t["reason"] == "open":
+            continue
+        years.setdefault(t["entry_date"][:4], []).append(t["outcome_r"])
+    print("\nyear   trades  win%   avgR    sumR")
+    for y in sorted(years):
+        r = np.array(years[y])
+        print(f"{y}   {len(r):5d}  {(r > 0).mean():5.1%}  {r.mean():+.3f}  {r.sum():+7.1f}")
+
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump({"stats": stats, "trades": trades}, f, indent=2)
+        print(f"\nwrote {len(trades)} trades -> {args.json}")
+
+
+def build_trade_dataset(args, p):
+    """Detect events, simulate trades, return one row per closed trade
+    (features + realized R). This is the training table for the model."""
+    market = load_market(args.period, args.cache_dir or None)
+    rows = []
+    for name, df in gather(args.tickers, args.period, args.csv,
+                           args.tickers_file, args.cache_dir):
+        for ev in detect_events(df, p, market):
+            tr = simulate_trade(df, ev, p)
+            if tr and tr["reason"] != "open":
+                row = dict(ticker=name, entry_date=tr["entry_date"],
+                           outcome_r=tr["outcome_r"], reason=tr["reason"])
+                row.update({f"f_{k}": ev["features"].get(k, np.nan)
+                            for k in FEATURE_NAMES})
+                rows.append(row)
+    return rows
+
+
+def _clean_X(X: np.ndarray) -> np.ndarray:
+    """Impute NaNs with the column median (0 for all-NaN columns).
+
+    sklearn's HistGradientBoosting crashes when a column is entirely NaN
+    inside any internal CV fold / chronological slice, so we impute up
+    front instead of relying on native NaN passthrough."""
+    X = X.copy()
+    med = np.nanmedian(np.where(np.isinf(X), np.nan, X), axis=0)
+    med = np.where(np.isnan(med), 0.0, med)
+    idx = np.where(~np.isfinite(X))
+    X[idx] = np.take(med, idx[1])
+    return X
+
+
+def _make_classifier():
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.ensemble import HistGradientBoostingClassifier
+
+    base = HistGradientBoostingClassifier(
+        max_iter=300, learning_rate=0.05, max_depth=3,
+        min_samples_leaf=40, l2_regularization=1.0, random_state=42,
+    )
+    return CalibratedClassifierCV(base, cv=3, method="sigmoid")
+
+
+def cmd_evaluate(args):
+    """Walk-forward evaluation: train on all years before Y, pick an
+    EV-maximizing probability threshold on the train set, apply it
+    out-of-sample on year Y. Reports whether model filtering beats the
+    take-every-trade baseline."""
+    p = build_params(args)
+
+    if args.dataset and os.path.exists(args.dataset):
+        with open(args.dataset) as f:
+            rows = json.load(f)
+        print(f"loaded {len(rows)} trades from {args.dataset}")
+    else:
+        rows = build_trade_dataset(args, p)
+        if args.dataset:
+            with open(args.dataset, "w") as f:
+                json.dump(rows, f)
+            print(f"built and saved {len(rows)} trades -> {args.dataset}")
+
+    data = pd.DataFrame(rows).sort_values("entry_date").reset_index(drop=True)
+    if len(data) < 500:
+        sys.exit(f"only {len(data)} trades - need a larger universe/history")
+
+    X = _clean_X(data[[f"f_{k}" for k in FEATURE_NAMES]].to_numpy(float))
+    r = data["outcome_r"].to_numpy(float)
+    y = (r > 0).astype(int)
+    years = data["entry_date"].str[:4].to_numpy()
+    dates = data["entry_date"].to_numpy()
+
+    print(f"\ntrades: {len(data)}  years {years.min()}-{years.max()}  "
+          f"baseline: win {y.mean():.1%}, avg R {r.mean():+.3f}")
+
+    folds = []
+    for ty in sorted(set(years)):
+        # purge: drop trades entered in Dec of the prior year (their exits
+        # can overlap the test year -> leakage)
+        train = (years < ty) & (dates < f"{int(ty) - 1}-12-01")
+        test = years == ty
+        if train.sum() < 400 or test.sum() < 30:
+            continue
+        model = _make_classifier()
+        model.fit(X[train], y[train])
+        p_tr = model.predict_proba(X[train])[:, 1]
+
+        best_t, best_avg = 0.5, -np.inf
+        for t in np.arange(0.40, 0.725, 0.025):
+            sel = p_tr >= t
+            if sel.sum() >= 100:
+                avg = r[train][sel].mean()
+                if avg > best_avg:
+                    best_avg, best_t = avg, t
+
+        p_te = model.predict_proba(X[test])[:, 1]
+        sel = p_te >= best_t
+        folds.append(dict(
+            year=ty, thr=round(float(best_t), 3),
+            base_n=int(test.sum()), base_avg=float(r[test].mean()),
+            filt_n=int(sel.sum()),
+            filt_avg=float(r[test][sel].mean()) if sel.any() else np.nan,
+            filt_sum=float(r[test][sel].sum()),
+        ))
+
+    if not folds:
+        sys.exit("not enough history for walk-forward folds")
+
+    print("\nyear   thr   base_n baseAvgR   filt_n filtAvgR   filtSumR")
+    for f in folds:
+        print(f"{f['year']}  {f['thr']:.3f}   {f['base_n']:5d}  {f['base_avg']:+.3f}"
+              f"    {f['filt_n']:5d}   {f['filt_avg']:+.3f}   {f['filt_sum']:+8.1f}")
+
+    base_all = np.concatenate([r[years == f["year"]] for f in folds])
+    filt_years = [f for f in folds if f["filt_n"] > 0]
+    filt_avg = (sum(f["filt_sum"] for f in filt_years)
+                / sum(f["filt_n"] for f in filt_years))
+    improved = sum(1 for f in folds
+                   if f["filt_n"] > 0 and f["filt_avg"] > f["base_avg"])
+    print(f"\nOOS pooled:  baseline avg R {base_all.mean():+.3f} "
+          f"({len(base_all)} trades)  |  filtered avg R {filt_avg:+.3f} "
+          f"({sum(f['filt_n'] for f in folds)} trades)")
+    print(f"years where filter beat baseline: {improved}/{len(folds)}")
+
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump(folds, f, indent=2)
+
+
+def cmd_universe(args):
+    """Fetch the current S&P 500 ticker list from Wikipedia."""
+    import io
+
+    import requests
+
+    r = requests.get(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        headers={"User-Agent": "Mozilla/5.0"}, timeout=30,
+    )
+    r.raise_for_status()
+    table = pd.read_html(io.StringIO(r.text))[0]
+    symbols = sorted(s.replace(".", "-") for s in table["Symbol"])
+    out = args.out or "sp500.txt"
+    with open(out, "w") as f:
+        f.write("\n".join(symbols) + "\n")
+    print(f"wrote {len(symbols)} tickers -> {out}")
+
+
 def cmd_scan(args):
     p = build_params(args)
     out = []
-    for name, df in gather(args.tickers, args.period, args.csv):
+    for name, df in gather(args.tickers, args.period, args.csv,
+                           args.tickers_file, args.cache_dir):
         events = detect_events(df, p)
         for ev in events:
             ev["ticker"] = name
@@ -391,54 +789,57 @@ def cmd_scan(args):
         print(f"\nwrote {len(out)} events -> {args.json}")
 
 
-def _dataset(tickers, period, csv, p):
-    X, y, meta = [], [], []
-    for name, df in gather(tickers, period, csv):
-        for ev in detect_events(df, p):
-            if ev["label"] is None:
-                continue
-            X.append([ev["features"][k] for k in FEATURE_NAMES])
-            y.append(ev["label"])
-            meta.append((name, ev["date_pb_end"]))
-    return np.array(X), np.array(y), meta
-
-
 def cmd_train(args):
+    """Train the final meta-labeling model on realized trades and pick the
+    EV-maximizing probability threshold; both are saved with the model."""
     from joblib import dump
-    from sklearn.ensemble import GradientBoostingClassifier
-    from sklearn.metrics import roc_auc_score, precision_score
+    from sklearn.metrics import roc_auc_score
 
     p = build_params(args)
-    X, y, meta = _dataset(args.tickers, args.period, args.csv, p)
-    if len(y) < 40:
-        sys.exit(f"only {len(y)} labeled events - need more tickers/history")
+    if args.dataset and os.path.exists(args.dataset):
+        with open(args.dataset) as f:
+            rows = json.load(f)
+        print(f"loaded {len(rows)} trades from {args.dataset}")
+    else:
+        rows = build_trade_dataset(args, p)
+        if args.dataset:
+            with open(args.dataset, "w") as f:
+                json.dump(rows, f)
+    data = pd.DataFrame(rows).sort_values("entry_date").reset_index(drop=True)
+    if len(data) < 200:
+        sys.exit(f"only {len(data)} trades - need more tickers/history")
 
-    order = np.argsort([m[1] for m in meta])  # chronological split
-    X, y = X[order], y[order]
+    X = _clean_X(data[[f"f_{k}" for k in FEATURE_NAMES]].to_numpy(float))
+    r = data["outcome_r"].to_numpy(float)
+    y = (r > 0).astype(int)
+
+    # holdout report (chronological last 25%) before refitting on everything
     split = int(len(y) * 0.75)
-    Xtr, Xte, ytr, yte = X[:split], X[split:], y[:split], y[split:]
+    hold = _make_classifier()
+    hold.fit(X[:split], y[:split])
+    proba = hold.predict_proba(X[split:])[:, 1]
+    auc = roc_auc_score(y[split:], proba) if len(set(y[split:])) > 1 else float("nan")
+    print(f"trades: {len(y)}  baseline win {y.mean():.1%}, avg R {r.mean():+.3f}")
+    print(f"holdout AUC (last 25%): {auc:.3f}")
 
-    model = GradientBoostingClassifier(
-        n_estimators=200, max_depth=3, learning_rate=0.05, subsample=0.8,
-        random_state=42,
-    )
-    model.fit(Xtr, ytr)
+    model = _make_classifier()
+    model.fit(X, y)
+    p_all = model.predict_proba(X)[:, 1]
+    best_t, best_avg = 0.5, -np.inf
+    for t in np.arange(0.40, 0.725, 0.025):
+        sel = p_all >= t
+        if sel.sum() >= 100:
+            avg = r[sel].mean()
+            if avg > best_avg:
+                best_avg, best_t = avg, t
+    sel = p_all >= best_t
+    print(f"threshold (EV-max, in-sample): {best_t:.3f} -> "
+          f"{sel.sum()} trades, avg R {r[sel].mean():+.3f} "
+          f"(vs {r.mean():+.3f} unfiltered)")
 
-    proba = model.predict_proba(Xte)[:, 1]
-    auc = roc_auc_score(yte, proba) if len(set(yte)) > 1 else float("nan")
-    picked = proba >= 0.60
-    prec = precision_score(yte, picked, zero_division=0) if picked.any() else float("nan")
-
-    print(f"dataset: {len(y)} events, base success rate {y.mean():.1%}")
-    print(f"test AUC: {auc:.3f}")
-    print(f"precision @ p>=0.60: {prec:.1%} ({picked.sum()} signals in test set)")
-    print("\nfeature importance:")
-    for name, imp in sorted(zip(FEATURE_NAMES, model.feature_importances_),
-                            key=lambda t: -t[1]):
-        print(f"  {name:14s} {imp:.3f}")
-
-    dump({"model": model, "features": FEATURE_NAMES, "params": p}, MODEL_PATH)
-    print(f"\nsaved model (with pattern params) -> {MODEL_PATH}")
+    dump({"model": model, "features": FEATURE_NAMES, "params": p,
+          "threshold": float(best_t)}, MODEL_PATH)
+    print(f"saved model (params + threshold) -> {MODEL_PATH}")
 
 
 def cmd_predict(args):
@@ -460,15 +861,21 @@ def cmd_predict(args):
             print(f"note: overriding trained params: {overrides}", file=sys.stderr)
             p.update(overrides)
 
+    threshold = bundle.get("threshold", 0.5)
+    market = load_market(args.period, args.cache_dir or None)
     found = False
-    for name, df in gather(args.tickers, args.period, args.csv):
-        events = [e for e in detect_events(df, p) if e["status"] == "active"]
+    for name, df in gather(args.tickers, args.period, args.csv,
+                           args.tickers_file, args.cache_dir):
+        events = [e for e in detect_events(df, p, market)
+                  if e["status"] == "active"]
         for ev in events:
-            x = np.array([[ev["features"][k] for k in bundle["features"]]])
-            p = model.predict_proba(x)[0, 1]
+            x = np.array([[ev["features"].get(k, np.nan)
+                           for k in bundle["features"]]], dtype=float)
+            prob = model.predict_proba(x)[0, 1]
+            verdict = "TAKE" if prob >= threshold else "skip"
             found = True
             print(f"{name}: ACTIVE pullback ended {ev['date_pb_end']} | "
-                  f"P(upward resolution) = {p:.1%}")
+                  f"P(win) = {prob:.1%} -> {verdict} (thr {threshold:.2f})")
             print(f"   entry trigger > {ev['pb_high']}, stop < {ev['pb_low']}, "
                   f"retrace {ev['retrace']:.0%}, len {ev['pb_len']}d")
     if not found:
@@ -482,13 +889,25 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for cmd, fn in [("scan", cmd_scan), ("train", cmd_train), ("predict", cmd_predict)]:
+
+    u = sub.add_parser("universe", help="fetch S&P 500 ticker list")
+    u.add_argument("--out", help="output file (default sp500.txt)")
+    u.set_defaults(fn=cmd_universe)
+
+    for cmd, fn in [("scan", cmd_scan), ("train", cmd_train),
+                    ("predict", cmd_predict), ("backtest", cmd_backtest),
+                    ("evaluate", cmd_evaluate)]:
         s = sub.add_parser(cmd)
         s.add_argument("--tickers", type=lambda v: v.split(",") if v else [],
                        default=[], help="comma separated tickers")
+        s.add_argument("--tickers-file", help="text file, one ticker per line")
         s.add_argument("--period", default="2y", help="yfinance period (e.g. 2y, 5y)")
         s.add_argument("--csv", help="path to a Date,OHLCV csv file")
-        s.add_argument("--json", help="scan only: write events to this json file")
+        s.add_argument("--cache-dir", default="cache",
+                       help="on-disk price cache dir ('' disables)")
+        s.add_argument("--json", help="scan/backtest/evaluate: write results to json")
+        s.add_argument("--dataset", help="train/evaluate: trade-dataset json "
+                                         "(built if missing, reused if present)")
         s.add_argument("--show", type=int, default=5,
                        help="scan only: how many recent events to print")
         s.add_argument("--config", help="json file with pattern parameters")
