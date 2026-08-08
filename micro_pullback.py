@@ -638,7 +638,9 @@ def build_trade_dataset(args, p):
             tr = simulate_trade(df, ev, p)
             if tr and tr["reason"] != "open":
                 row = dict(ticker=name, entry_date=tr["entry_date"],
-                           outcome_r=tr["outcome_r"], reason=tr["reason"])
+                           exit_date=tr["exit_date"],
+                           outcome_r=tr["outcome_r"], reason=tr["reason"],
+                           risk_pct=round(tr["risk"] / tr["entry_px"], 5))
                 row.update({f"f_{k}": ev["features"].get(k, np.nan)
                             for k in FEATURE_NAMES})
                 rows.append(row)
@@ -805,6 +807,104 @@ def cmd_evaluate(args):
             json.dump(folds, f, indent=2)
 
 
+def cmd_portfolio(args):
+    """Portfolio simulation with real capital constraints: fixed fraction
+    of current equity risked per trade, total exposure capped at 100% (no
+    leverage), compounding, and - when signals exceed capacity - optional
+    prioritization by walk-forward model score (each year's model trained
+    only on prior years). Equity is marked on realized exits."""
+    p = build_params(args)
+    if args.dataset and os.path.exists(args.dataset):
+        with open(args.dataset) as f:
+            rows = json.load(f)
+    else:
+        rows = build_trade_dataset(args, p)
+        if args.dataset:
+            with open(args.dataset, "w") as f:
+                json.dump(rows, f)
+    data = pd.DataFrame(rows).sort_values("entry_date").reset_index(drop=True)
+    if "risk_pct" not in data.columns:
+        sys.exit("dataset lacks risk_pct/exit_date - rebuild it (delete the file)")
+
+    # walk-forward model scores for prioritization
+    X = _clean_X(data[[f"f_{k}" for k in FEATURE_NAMES]].to_numpy(float))
+    r = data["outcome_r"].to_numpy(float)
+    years = data["entry_date"].str[:4].to_numpy()
+    dates_arr = data["entry_date"].to_numpy()
+    score = np.zeros(len(data))
+    if not args.no_model:
+        for ty in sorted(set(years)):
+            train = (years < ty) & (dates_arr < f"{int(ty) - 1}-12-01")
+            test = years == ty
+            if train.sum() < 400:
+                continue
+            m = _make_model()
+            m.fit(X[train], np.clip(r[train], -R_CLIP, R_CLIP))
+            score[test] = m.predict(X[test])
+
+    equity = args.capital
+    invested = 0.0
+    open_pos = []  # (exit_date, pnl_dollars, pos_value)
+    curve = []
+    skipped = taken = 0
+
+    by_day = {d: g.index.tolist() for d, g in data.groupby("entry_date")}
+    all_days = sorted(set(data["entry_date"]) | set(data["exit_date"]))
+    for day in all_days:
+        # close exits first - frees capital for the same day's entries
+        still = []
+        for exit_date, pnl, pv in open_pos:
+            if exit_date <= day:
+                equity += pnl
+                invested -= pv
+            else:
+                still.append((exit_date, pnl, pv))
+        open_pos = still
+
+        idxs = by_day.get(day, [])
+        idxs.sort(key=lambda i: -score[i])  # best expected R first
+        for i in idxs:
+            row = data.iloc[i]
+            risk_d = args.risk * equity
+            pos_val = risk_d / max(row["risk_pct"], 1e-4)
+            if invested + pos_val > equity * args.max_exposure:
+                skipped += 1
+                continue
+            invested += pos_val
+            open_pos.append((row["exit_date"], row["outcome_r"] * risk_d, pos_val))
+            taken += 1
+        curve.append((day, equity))
+
+    for _, pnl, _ in open_pos:  # flush anything still open
+        equity += pnl
+    curve.append((all_days[-1], equity))
+
+    c = pd.Series(dict(curve))
+    c.index = pd.to_datetime(c.index)
+    yrs = (c.index[-1] - c.index[0]).days / 365.25
+    cagr = (equity / args.capital) ** (1 / yrs) - 1
+    dd = float(((c.cummax() - c) / c.cummax()).max())
+    label = "FIFO (no model)" if args.no_model else "model-prioritized"
+    print(f"\n=== PORTFOLIO  {label}  risk {args.risk:.2%}/trade, "
+          f"exposure<= {args.max_exposure:.0%}, start ${args.capital:,.0f} ===")
+    print(f"trades taken: {taken}   skipped (no capacity): {skipped}")
+    print(f"final equity: ${equity:,.0f}   CAGR: {cagr:+.1%}   "
+          f"max drawdown: {dd:.1%}")
+    yearly = c.resample("YE").last()
+    prev = args.capital
+    print("\nyear    equity        return")
+    for ts, v in yearly.items():
+        print(f"{ts.year}   ${v:>12,.0f}   {v / prev - 1:+8.1%}")
+        prev = v
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump({"curve": {str(k.date()): round(float(v), 2)
+                                 for k, v in c.items()},
+                       "cagr": cagr, "max_dd": dd, "final": equity,
+                       "taken": taken, "skipped": skipped}, f, indent=1)
+        print(f"\nwrote equity curve -> {args.json}")
+
+
 def cmd_universe(args):
     """Fetch the current S&P 500 ticker list from Wikipedia."""
     import io
@@ -964,7 +1064,7 @@ def main():
 
     for cmd, fn in [("scan", cmd_scan), ("train", cmd_train),
                     ("predict", cmd_predict), ("backtest", cmd_backtest),
-                    ("evaluate", cmd_evaluate)]:
+                    ("evaluate", cmd_evaluate), ("portfolio", cmd_portfolio)]:
         s = sub.add_parser(cmd)
         s.add_argument("--tickers", type=lambda v: v.split(",") if v else [],
                        default=[], help="comma separated tickers")
@@ -974,8 +1074,16 @@ def main():
         s.add_argument("--cache-dir", default="cache",
                        help="on-disk price cache dir ('' disables)")
         s.add_argument("--json", help="scan/backtest/evaluate: write results to json")
-        s.add_argument("--dataset", help="train/evaluate: trade-dataset json "
-                                         "(built if missing, reused if present)")
+        s.add_argument("--dataset", help="train/evaluate/portfolio: trade-dataset "
+                                         "json (built if missing, reused if present)")
+        s.add_argument("--capital", type=float, default=100_000,
+                       help="portfolio: starting equity (default 100k)")
+        s.add_argument("--risk", type=float, default=0.0025,
+                       help="portfolio: fraction of equity risked per trade")
+        s.add_argument("--max-exposure", type=float, default=1.0,
+                       help="portfolio: max invested fraction of equity")
+        s.add_argument("--no-model", action="store_true",
+                       help="portfolio: first-come-first-served, no ranking")
         s.add_argument("--show", type=int, default=5,
                        help="scan only: how many recent events to print")
         s.add_argument("--config", help="json file with pattern parameters")
