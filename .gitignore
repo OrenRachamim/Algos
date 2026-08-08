@@ -11,3 +11,5 @@ eval_*.log
 trades_*.json
 eval_*.json
 predict_today.txt
+sweep_*.log
+sweep_results.json
