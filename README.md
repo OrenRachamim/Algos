@@ -35,6 +35,36 @@ python micro_pullback.py scan  --csv data/PAYX.csv
 python micro_pullback.py train --csv data_dir/          # תיקייה שלמה
 ```
 
+## קונפיגורציה של פרמטרי הדפוס
+
+כל פרמטרי הזיהוי ניתנים לשינוי בשתי דרכים (CLI גובר על קובץ, קובץ גובר על ברירות מחדל):
+
+```bash
+# דגלים ב-CLI
+python micro_pullback.py scan --tickers PAYX --impulse-min-gain 0.08 --max-retrace 0.5
+
+# קובץ json (ראו mp_config.example.json)
+python micro_pullback.py scan --tickers PAYX --config my_config.json
+```
+
+| פרמטר | ברירת מחדל | תיאור |
+|---|---|---|
+| `impulse_days` | 10 | חלון רגל האימפולס בימים |
+| `impulse_min_gain` | 0.05 | עלייה מינימלית ברגל (5%) |
+| `impulse_min_green` | 0.55 | שיעור מינימלי של נרות ירוקים ברגל |
+| `pullback_min_len` | 1 | אורך pullback מינימלי בנרות |
+| `pullback_max_len` | 4 | אורך pullback מקסימלי בנרות |
+| `max_retrace` | 0.618 | ריטרייס מקסימלי מטווח הרגל |
+| `vol_contraction` | 1.10 | תקרת יחס מחזור pullback/אימפולס |
+| `confirm_within` | 5 | ימים מקסימליים עד פריצה מאשרת |
+| `label_horizon` | 10 | חלון תיוג למודל (ימים קדימה) |
+| `label_target_atr` | 1.5 | יעד הצלחה ב-ATR מעל שיא ה-pullback |
+| `label_stop_atr` | 1.0 | סטופ תיוג ב-ATR מתחת לנמוך ה-pullback |
+
+`train` שומר את הפרמטרים בתוך קובץ המודל, ו-`predict` משתמש אוטומטית באותם
+פרמטרים שאיתם המודל אומן — כדי שהזיהוי והחיזוי יהיו עקביים. אפשר לעקוף גם
+שם עם דגלים מפורשים (תודפס אזהרה).
+
 ## המודל
 
 GradientBoosting על פיצ'רים של כל אירוע: עומק הריטרייס, אורך ה־pullback,

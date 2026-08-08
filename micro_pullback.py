@@ -44,6 +44,31 @@ DEFAULTS = dict(
     label_stop_atr=1.0,     # ... before -1.0 ATR below pullback low
 )
 
+INT_PARAMS = {"impulse_days", "pullback_min_len", "pullback_max_len",
+              "confirm_within", "label_horizon"}
+
+
+def build_params(args) -> dict:
+    """Merge pattern parameters: DEFAULTS < --config file < CLI flags."""
+    p = dict(DEFAULTS)
+    if getattr(args, "config", None):
+        with open(args.config) as f:
+            cfg = json.load(f)
+        unknown = set(cfg) - set(DEFAULTS)
+        if unknown:
+            sys.exit(f"unknown parameter(s) in {args.config}: {', '.join(sorted(unknown))}")
+        p.update(cfg)
+    for k in DEFAULTS:
+        v = getattr(args, k, None)
+        if v is not None:
+            p[k] = v
+    return p
+
+
+def explicit_cli_params(args) -> dict:
+    """Only the parameters the user set explicitly via CLI flags."""
+    return {k: getattr(args, k) for k in DEFAULTS if getattr(args, k, None) is not None}
+
 # ---------------------------------------------------------------- indicators
 
 
@@ -157,7 +182,8 @@ def detect_events(df: pd.DataFrame, p: dict = DEFAULTS):
             pb_high=round(float(pb_high), 2),
             pb_low=round(float(pb_low), 2),
         )
-        event["features"] = extract_features(df, i, pb_rows, leg_gain, retrace, pb_vol_ratio)
+        event["features"] = extract_features(df, i, pb_rows, leg_gain, retrace,
+                                             pb_vol_ratio, p)
 
         # ---- outcome: does a breakout above pb_high happen within confirm_within days?
         status, label = "active", None
@@ -202,9 +228,9 @@ FEATURE_NAMES = [
 ]
 
 
-def extract_features(df, leg_end_i, pb_rows, leg_gain, retrace, pb_vol_ratio):
+def extract_features(df, leg_end_i, pb_rows, leg_gain, retrace, pb_vol_ratio, p):
     last = df.iloc[pb_rows[-1]]
-    leg = df.iloc[leg_end_i - DEFAULTS["impulse_days"]: leg_end_i + 1]
+    leg = df.iloc[leg_end_i - p["impulse_days"]: leg_end_i + 1]
     close = last["Close"]
     return dict(
         leg_gain=float(leg_gain),
@@ -271,9 +297,10 @@ def gather(tickers, period, csv):
 
 
 def cmd_scan(args):
+    p = build_params(args)
     out = []
     for name, df in gather(args.tickers, args.period, args.csv):
-        events = detect_events(df)
+        events = detect_events(df, p)
         for ev in events:
             ev["ticker"] = name
         out.extend(events)
@@ -292,10 +319,10 @@ def cmd_scan(args):
         print(f"\nwrote {len(out)} events -> {args.json}")
 
 
-def _dataset(tickers, period, csv):
+def _dataset(tickers, period, csv, p):
     X, y, meta = [], [], []
     for name, df in gather(tickers, period, csv):
-        for ev in detect_events(df):
+        for ev in detect_events(df, p):
             if ev["label"] is None:
                 continue
             X.append([ev["features"][k] for k in FEATURE_NAMES])
@@ -309,7 +336,8 @@ def cmd_train(args):
     from sklearn.ensemble import GradientBoostingClassifier
     from sklearn.metrics import roc_auc_score, precision_score
 
-    X, y, meta = _dataset(args.tickers, args.period, args.csv)
+    p = build_params(args)
+    X, y, meta = _dataset(args.tickers, args.period, args.csv, p)
     if len(y) < 40:
         sys.exit(f"only {len(y)} labeled events - need more tickers/history")
 
@@ -337,8 +365,8 @@ def cmd_train(args):
                             key=lambda t: -t[1]):
         print(f"  {name:14s} {imp:.3f}")
 
-    dump({"model": model, "features": FEATURE_NAMES}, MODEL_PATH)
-    print(f"\nsaved model -> {MODEL_PATH}")
+    dump({"model": model, "features": FEATURE_NAMES, "params": p}, MODEL_PATH)
+    print(f"\nsaved model (with pattern params) -> {MODEL_PATH}")
 
 
 def cmd_predict(args):
@@ -349,9 +377,20 @@ def cmd_predict(args):
     bundle = load(MODEL_PATH)
     model = bundle["model"]
 
+    # detect with the exact params the model was trained on, unless the
+    # user explicitly overrides via --config / CLI flags
+    p = dict(bundle.get("params", DEFAULTS))
+    if getattr(args, "config", None):
+        p = build_params(args)
+    else:
+        overrides = explicit_cli_params(args)
+        if overrides:
+            print(f"note: overriding trained params: {overrides}", file=sys.stderr)
+            p.update(overrides)
+
     found = False
     for name, df in gather(args.tickers, args.period, args.csv):
-        events = [e for e in detect_events(df) if e["status"] == "active"]
+        events = [e for e in detect_events(df, p) if e["status"] == "active"]
         for ev in events:
             x = np.array([[ev["features"][k] for k in bundle["features"]]])
             p = model.predict_proba(x)[0, 1]
@@ -380,6 +419,12 @@ def main():
         s.add_argument("--json", help="scan only: write events to this json file")
         s.add_argument("--show", type=int, default=5,
                        help="scan only: how many recent events to print")
+        s.add_argument("--config", help="json file with pattern parameters")
+        pat = s.add_argument_group("pattern parameters (override config/defaults)")
+        for k, v in DEFAULTS.items():
+            pat.add_argument(f"--{k.replace('_', '-')}", dest=k, default=None,
+                             type=int if k in INT_PARAMS else float,
+                             help=f"default: {v}")
         s.set_defaults(fn=fn)
     args = ap.parse_args()
     args.fn(args)

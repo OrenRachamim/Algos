@@ -1,0 +1,13 @@
+{
+  "impulse_days": 10,
+  "impulse_min_gain": 0.05,
+  "impulse_min_green": 0.55,
+  "pullback_min_len": 1,
+  "pullback_max_len": 4,
+  "max_retrace": 0.618,
+  "vol_contraction": 1.10,
+  "confirm_within": 5,
+  "label_horizon": 10,
+  "label_target_atr": 1.5,
+  "label_stop_atr": 1.0
+}
