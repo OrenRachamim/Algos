@@ -7,5 +7,6 @@ cache/
 sp500.txt
 bt_*.json
 bt_*.log
+eval_*.log
 trades_*.json
 eval_*.json
