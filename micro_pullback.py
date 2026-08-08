@@ -277,13 +277,57 @@ def extract_features(df, leg_end_i, pb_rows, leg_gain, retrace, pb_vol_ratio,
 
 
 def load_ticker(ticker: str, period: str) -> pd.DataFrame:
-    import yfinance as yf
+    try:
+        import logging
 
-    df = yf.download(ticker, period=period, interval="1d",
-                     progress=False, auto_adjust=True)
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df.dropna()
+        import yfinance as yf
+
+        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+        df = yf.download(ticker, period=period, interval="1d",
+                         progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.dropna()
+        if len(df):
+            return df
+    except Exception:
+        pass
+    return _yahoo_chart_api(ticker, period)
+
+
+def _yahoo_chart_api(ticker: str, period: str) -> pd.DataFrame:
+    """Fallback: fetch daily bars straight from Yahoo's chart API.
+
+    Works in environments where yfinance's curl_cffi transport fails
+    (e.g. behind TLS-intercepting proxies).
+    """
+    import requests
+
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    r = requests.get(
+        url,
+        params={"range": period, "interval": "1d", "events": "div,split"},
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    res = r.json()["chart"]["result"][0]
+    quote = res["indicators"]["quote"][0]
+    adj = res["indicators"].get("adjclose", [{}])[0].get("adjclose")
+
+    df = pd.DataFrame(
+        {"Open": quote["open"], "High": quote["high"], "Low": quote["low"],
+         "Close": quote["close"], "Volume": quote["volume"]},
+        index=pd.to_datetime(res["timestamp"], unit="s").normalize(),
+    ).dropna()
+    df.index.name = "Date"
+
+    if adj is not None:  # adjust OHLC the same way yfinance auto_adjust does
+        adj = pd.Series(adj, index=pd.to_datetime(res["timestamp"], unit="s").normalize())
+        factor = (adj / df["Close"]).reindex(df.index)
+        for col in ("Open", "High", "Low", "Close"):
+            df[col] = df[col] * factor
+    return df
 
 
 def load_csv(path: str) -> pd.DataFrame:
