@@ -2,6 +2,7 @@
   "impulse_days": 10,
   "impulse_min_gain": 0.05,
   "impulse_min_green": 0.55,
+  "impulse_min_rvol": 1.2,
   "pullback_min_len": 1,
   "pullback_max_len": 4,
   "max_retrace": 0.618,

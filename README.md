@@ -52,6 +52,7 @@ python micro_pullback.py scan --tickers PAYX --config my_config.json
 | `impulse_days` | 10 | חלון רגל האימפולס בימים |
 | `impulse_min_gain` | 0.05 | עלייה מינימלית ברגל (5%) |
 | `impulse_min_green` | 0.55 | שיעור מינימלי של נרות ירוקים ברגל |
+| `impulse_min_rvol` | 1.2 | נפח הרגל ביחס לנפח הממוצע (20 יום) שלפניה — מסנן אימפולסים בנפח דליל (0 = כבוי) |
 | `pullback_min_len` | 1 | אורך pullback מינימלי בנרות |
 | `pullback_max_len` | 4 | אורך pullback מקסימלי בנרות |
 | `max_retrace` | 0.618 | ריטרייס מקסימלי מטווח הרגל |
@@ -68,7 +69,8 @@ python micro_pullback.py scan --tickers PAYX --config my_config.json
 ## המודל
 
 GradientBoosting על פיצ'רים של כל אירוע: עומק הריטרייס, אורך ה־pullback,
-יחס המחזורים, RSI, מרחק מ־EMA10/20, שיפוע המגמה, ATR יחסי ועוד.
+יחס המחזורים, נפח יחסי של האימפולס (rvol), שיפוע הנפח בתוך הנסיגה
+(שלילי = המוכרים מתייבשים), RSI, מרחק מ־EMA10/20, שיפוע המגמה, ATR יחסי ועוד.
 תווית הצלחה: המחיר עולה ‎+1.5 ATR מעל שיא ה־pullback לפני שהוא יורד
 ‎-1.0 ATR מתחת לנמוך שלו, בחלון של 10 ימים. הפיצול לאימון/בדיקה כרונולוגי
 (ללא זליגת עתיד).

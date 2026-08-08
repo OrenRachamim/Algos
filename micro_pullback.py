@@ -34,6 +34,7 @@ DEFAULTS = dict(
     impulse_days=10,        # lookback window for the impulse leg
     impulse_min_gain=0.05,  # leg must gain >= 5%
     impulse_min_green=0.55, # >= 55% of leg candles close up
+    impulse_min_rvol=1.2,   # leg avg volume >= 1.2x the 20d avg volume before the leg
     pullback_min_len=1,
     pullback_max_len=4,
     max_retrace=0.618,      # pullback may retrace <= 61.8% of the leg
@@ -119,14 +120,25 @@ def detect_events(df: pd.DataFrame, p: dict = DEFAULTS):
     i = p["impulse_days"] + 50  # room for indicators to warm up
 
     while i < n - 1:
-        leg = df.iloc[i - p["impulse_days"]: i + 1]
+        leg_start_i = i - p["impulse_days"]
+        leg = df.iloc[leg_start_i: i + 1]
         leg_gain = leg["Close"].iloc[-1] / leg["Close"].iloc[0] - 1
         green_ratio = (leg["Close"] > leg["Open"]).mean()
         row = df.iloc[i]
 
+        # impulse volume quality: leg volume relative to the 20d average
+        # volume *before* the leg started (so the leg doesn't inflate its
+        # own baseline)
+        base_vol = df["vol_sma20"].iloc[leg_start_i]
+        impulse_rvol = (
+            leg["Volume"].mean() / base_vol
+            if base_vol and not np.isnan(base_vol) else 1.0
+        )
+
         trend_ok = (
             leg_gain >= p["impulse_min_gain"]
             and green_ratio >= p["impulse_min_green"]
+            and impulse_rvol >= p["impulse_min_rvol"]
             and row["Close"] > row["ema20"]
             and (np.isnan(row["sma50"]) or row["Close"] > row["sma50"])
         )
@@ -162,6 +174,14 @@ def detect_events(df: pd.DataFrame, p: dict = DEFAULTS):
         impulse_vol = leg["Volume"].mean()
         pb_vol_ratio = pb["Volume"].mean() / max(impulse_vol, 1)
 
+        # volume trend inside the pullback: negative slope = sellers drying
+        # up (bullish), positive = selling pressure building (bearish)
+        v = pb["Volume"].to_numpy(dtype=float)
+        if len(v) >= 2 and v.mean() > 0:
+            pb_vol_slope = float(np.polyfit(np.arange(len(v)), v / v.mean(), 1)[0])
+        else:
+            pb_vol_slope = 0.0
+
         shallow_ok = retrace <= p["max_retrace"] and pb_low > df.iloc[i]["ema20"] * 0.985
         vol_ok = pb_vol_ratio <= p["vol_contraction"]
         if not (shallow_ok and vol_ok):
@@ -179,11 +199,14 @@ def detect_events(df: pd.DataFrame, p: dict = DEFAULTS):
             pb_len=len(pb_rows),
             retrace=round(float(retrace), 3),
             pb_vol_ratio=round(float(pb_vol_ratio), 3),
+            impulse_rvol=round(float(impulse_rvol), 2),
+            pb_vol_slope=round(pb_vol_slope, 3),
             pb_high=round(float(pb_high), 2),
             pb_low=round(float(pb_low), 2),
         )
         event["features"] = extract_features(df, i, pb_rows, leg_gain, retrace,
-                                             pb_vol_ratio, p)
+                                             pb_vol_ratio, impulse_rvol,
+                                             pb_vol_slope, p)
 
         # ---- outcome: does a breakout above pb_high happen within confirm_within days?
         status, label = "active", None
@@ -223,12 +246,14 @@ def detect_events(df: pd.DataFrame, p: dict = DEFAULTS):
 
 
 FEATURE_NAMES = [
-    "leg_gain", "retrace", "pb_len", "pb_vol_ratio", "rsi14",
-    "dist_ema10", "dist_ema20", "slope20", "atr_pct", "green_ratio",
+    "leg_gain", "retrace", "pb_len", "pb_vol_ratio", "impulse_rvol",
+    "pb_vol_slope", "rsi14", "dist_ema10", "dist_ema20", "slope20",
+    "atr_pct", "green_ratio",
 ]
 
 
-def extract_features(df, leg_end_i, pb_rows, leg_gain, retrace, pb_vol_ratio, p):
+def extract_features(df, leg_end_i, pb_rows, leg_gain, retrace, pb_vol_ratio,
+                     impulse_rvol, pb_vol_slope, p):
     last = df.iloc[pb_rows[-1]]
     leg = df.iloc[leg_end_i - p["impulse_days"]: leg_end_i + 1]
     close = last["Close"]
@@ -237,6 +262,8 @@ def extract_features(df, leg_end_i, pb_rows, leg_gain, retrace, pb_vol_ratio, p)
         retrace=float(retrace),
         pb_len=float(len(pb_rows)),
         pb_vol_ratio=float(pb_vol_ratio),
+        impulse_rvol=float(impulse_rvol),
+        pb_vol_slope=float(pb_vol_slope),
         rsi14=float(last["rsi14"]),
         dist_ema10=float(close / last["ema10"] - 1),
         dist_ema20=float(close / last["ema20"] - 1),
@@ -312,6 +339,7 @@ def cmd_scan(args):
             print(f"  {e['date_pb_end']}  status={e['status']:9s} "
                   f"leg=+{e['leg_gain']:.1%} retrace={e['retrace']:.0%} "
                   f"len={e['pb_len']} vol={e['pb_vol_ratio']:.2f} "
+                  f"rvol={e['impulse_rvol']:.1f} vslope={e['pb_vol_slope']:+.2f} "
                   f"trigger>{e['pb_high']} stop<{e['pb_low']}")
     if args.json:
         with open(args.json, "w") as f:
