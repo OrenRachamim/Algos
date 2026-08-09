@@ -148,8 +148,25 @@ def main():
         if len(combos) > 60:
             combos = list(rng.choice(combos, size=60, replace=False))
         configs = combos
-    else:
+    elif mode != "theories":
         sys.exit(f"unknown mode {mode}")
+
+    if mode == "theories":
+        configs = [
+            {},  # champion baseline
+            {"impulse_min_rvol": 1.8},
+            {"impulse_min_rvol": 2.0},
+            {"trade_target_r": 4.0},
+            {"trade_target_r": 5.0},
+            {"trade_target_r": 0.0, "trade_max_hold": 40},
+            {"trade_max_hold": 40},
+            {"trade_trail_ema": 10, "trade_target_r": 0.0, "trade_max_hold": 60},
+            {"trade_trail_ema": 20, "trade_target_r": 0.0, "trade_max_hold": 60},
+            {"trade_trail_ema": 20, "trade_target_r": 3.0, "trade_max_hold": 60},
+            {"stop_buffer_atr": 0.3},
+            {"stop_buffer_atr": 0.5},
+            {"impulse_days": 5},
+        ]
 
     print(f"running {len(configs)} configs...")
     with Pool(min(8, os.cpu_count() or 4)) as pool:

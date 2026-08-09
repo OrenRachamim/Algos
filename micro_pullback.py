@@ -50,10 +50,13 @@ DEFAULTS = dict(
     trade_target_r=3.0,     # backtest: profit target in R (0 = time exit only)
     trade_max_hold=25,      # backtest: max holding days after entry
     trade_cost_bps=10.0,    # backtest: round-trip cost+slippage in basis points
+    stop_buffer_atr=0.0,    # extra stop distance below the pullback low, in ATR
+    trade_trail_ema=0,      # exit on close < EMA(n) instead of waiting for target (0=off)
 )
 
 INT_PARAMS = {"impulse_days", "pullback_min_len", "pullback_max_len",
-              "confirm_within", "label_horizon", "trade_max_hold"}
+              "confirm_within", "label_horizon", "trade_max_hold",
+              "trade_trail_ema"}
 
 
 def build_params(args) -> dict:
@@ -246,6 +249,7 @@ def detect_events(df: pd.DataFrame, p: dict = DEFAULTS, market=None):
             pb_vol_slope=round(pb_vol_slope, 3),
             pb_high=round(float(pb_high), 4),
             pb_low=round(float(pb_low), 4),
+            atr=round(float(atr), 4),
             features=features,
         )
 
@@ -504,7 +508,12 @@ def simulate_trade(df: pd.DataFrame, ev: dict, p: dict):
     Returns None when the trigger never fires (or breaks down first).
     """
     n = len(df)
-    trigger, stop = ev["pb_high"], ev["pb_low"]
+    trigger = ev["pb_high"]
+    stop = ev["pb_low"] - p["stop_buffer_atr"] * ev.get("atr", 0.0)
+    trail = None
+    if p["trade_trail_ema"]:
+        trail = df["Close"].ewm(span=p["trade_trail_ema"],
+                                adjust=False).mean().to_numpy(float)
     entry_i = None
     for k in range(ev["pb_end"] + 1, min(ev["pb_end"] + 1 + p["confirm_within"], n)):
         row = df.iloc[k]
@@ -532,6 +541,9 @@ def simulate_trade(df: pd.DataFrame, ev: dict, p: dict):
         if target is not None and row["High"] >= target:
             exit_px = max(target, row["Open"]) if k > entry_i else target
             exit_i, reason = k, "target"
+            break
+        if trail is not None and k > entry_i and row["Close"] < trail[k]:
+            exit_px, exit_i, reason = row["Close"], k, "time"
             break
         if k - entry_i + 1 >= p["trade_max_hold"]:
             exit_px, exit_i, reason = row["Close"], k, "time"
