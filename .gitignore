@@ -26,3 +26,5 @@ trades_filtered.json
 exit_lab_results.json
 exit_lab_extra.json
 exit_*.log
+exit_riskmatch.log
+final_exit_verify.log

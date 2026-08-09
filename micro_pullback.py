@@ -52,6 +52,7 @@ DEFAULTS = dict(
     trade_cost_bps=10.0,    # backtest: round-trip cost+slippage in basis points
     stop_buffer_atr=0.0,    # extra stop distance below the pullback low, in ATR
     trade_trail_ema=0,      # exit on close < EMA(n) instead of waiting for target (0=off)
+    trade_trail_pct=0.11,   # trail the stop X% below the highest high since entry (0=off)
 )
 
 INT_PARAMS = {"impulse_days", "pullback_min_len", "pullback_max_len",
@@ -532,6 +533,7 @@ def simulate_trade(df: pd.DataFrame, ev: dict, p: dict):
     target = entry_px + p["trade_target_r"] * risk if p["trade_target_r"] > 0 else None
 
     exit_px, exit_i, reason = None, None, None
+    peak = entry_px
     for k in range(entry_i, n):
         row = df.iloc[k]
         if row["Low"] <= stop:
@@ -548,6 +550,11 @@ def simulate_trade(df: pd.DataFrame, ev: dict, p: dict):
         if k - entry_i + 1 >= p["trade_max_hold"]:
             exit_px, exit_i, reason = row["Close"], k, "time"
             break
+        # end of day: ratchet the percent-trail for TOMORROW (no lookahead -
+        # today's stop level was computed through yesterday's peak)
+        peak = max(peak, row["High"])
+        if p["trade_trail_pct"] > 0:
+            stop = max(stop, peak * (1 - p["trade_trail_pct"]))
     if exit_i is None:  # still open at end of data
         exit_px, exit_i, reason = df.iloc[-1]["Close"], n - 1, "open"
 
