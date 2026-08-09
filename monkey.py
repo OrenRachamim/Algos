@@ -51,13 +51,14 @@ def sim(arr, k, risk_pct):
     entry = arr["o"][k]
     stop = entry * (1 - risk_pct)
     risk = entry - stop
-    target = entry + P["trade_target_r"] * risk
+    target = (entry + P["trade_target_r"] * risk
+              if P["trade_target_r"] > 0 else None)
     n = len(arr["c"])
     for j in range(k, min(k + P["trade_max_hold"], n)):
         if arr["lo"][j] <= stop:
             exit_px = min(stop, arr["o"][j]) if j > k else stop
             break
-        if arr["h"][j] >= target:
+        if target is not None and arr["h"][j] >= target:
             exit_px = max(target, arr["o"][j]) if j > k else target
             break
     else:
