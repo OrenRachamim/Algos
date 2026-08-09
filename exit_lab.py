@@ -60,6 +60,7 @@ def load():
             dates=np.array([str(d.date()) for d in df.index]),
             o=df["Open"].to_numpy(float), h=df["High"].to_numpy(float),
             lo=df["Low"].to_numpy(float), c=df["Close"].to_numpy(float),
+            atr=df["atr14"].to_numpy(float),
         )
         out[t] = (arrays, events)
     _DATA = out
@@ -133,6 +134,17 @@ def sim_exit(arr, ev, pol):
             lvl = max(lvl, peak * (1 - pol["trail_pct"]))
         if pol.get("trail_atr") and active:
             lvl = max(lvl, peak - pol["trail_atr"] * atr)
+        # adaptive trails: width interpolates start->end along a driver
+        if pol.get("trail_profit"):  # (start_pct, end_pct, r_span)
+            s, e, span = pol["trail_profit"]
+            w = s + (e - s) * min(exc_r / span, 1.0)
+            lvl = max(lvl, peak * (1 - w))
+        if pol.get("trail_time"):    # (start_pct, end_pct) over max_hold
+            s, e = pol["trail_time"]
+            w = s + (e - s) * min((k - entry_i) / max_hold, 1.0)
+            lvl = max(lvl, peak * (1 - w))
+        if pol.get("trail_atr_roll"):  # k * rolling ATR below the peak
+            lvl = max(lvl, peak - pol["trail_atr_roll"] * arr["atr"][k])
         if pol.get("ratchet_r") and exc_r >= pol["ratchet_r"]:
             steps = int(exc_r / pol["ratchet_r"])
             lvl = max(lvl, entry + (steps - 1) * pol["ratchet_r"] * risk)
