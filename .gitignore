@@ -23,3 +23,6 @@ monkey_*.log
 trades_best_orig.json
 trades_best_backup_swap.json
 trades_filtered.json
+exit_lab_results.json
+exit_lab_extra.json
+exit_*.log
