@@ -22,3 +22,4 @@ theories2.log
 monkey_*.log
 trades_best_orig.json
 trades_best_backup_swap.json
+trades_filtered.json
