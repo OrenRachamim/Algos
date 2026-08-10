@@ -28,3 +28,7 @@ exit_lab_extra.json
 exit_*.log
 exit_riskmatch.log
 final_exit_verify.log
+support_stage*.log
+trades_sr.json
+exit_adaptive.log
+exit_riskmatch2.log
