@@ -1065,6 +1065,7 @@ def cmd_predict(args):
                   f"(thr {threshold:+.2f})")
             print(f"   entry trigger > {ev['pb_high']}, stop < {ev['pb_low']}, "
                   f"retrace {ev['retrace']:.0%}, len {ev['pb_len']}d")
+            print(f"   chart: https://www.tradingview.com/chart/?symbol={name}")
     if not found:
         print("no active (unconfirmed) micro pullbacks right now")
 
