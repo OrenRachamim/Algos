@@ -1066,6 +1066,20 @@ def cmd_predict(args):
             print(f"   entry trigger > {ev['pb_high']}, stop < {ev['pb_low']}, "
                   f"retrace {ev['retrace']:.0%}, len {ev['pb_len']}d")
             print(f"   chart: https://www.tradingview.com/chart/?symbol={name}")
+            try:  # informational S/R context (validated per-trade, not a filter)
+                from support_lab import sr_features
+
+                arr = dict(h=df["High"].to_numpy(float),
+                           lo=df["Low"].to_numpy(float))
+                sr = sr_features(df, arr, ev)
+                tags = []
+                if sr["gap_support"]:
+                    tags.append("gap-support")
+                if 1 <= sr["sup_touches"] < 6:
+                    tags.append(f"support-zone({sr['sup_touches']} touches)")
+                print(f"   support: {', '.join(tags) if tags else 'none detected'}")
+            except Exception:
+                pass
     if not found:
         print("no active (unconfirmed) micro pullbacks right now")
 
